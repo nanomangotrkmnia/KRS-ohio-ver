@@ -2,7 +2,9 @@
 
 ### [Join the client discord server](https://discord.gg/nMTEzHcwSW)
 
-### Needs Via Version?
+### Recommend Mods
+
+[Alt Manager (ADHD Reloginer) Mod](https://github.com/Aspw-w/ADHD-Reloginer)
 
 [ViaFabricPlus Mod](https://github.com/ViaVersion/ViaFabricPlus)
 
