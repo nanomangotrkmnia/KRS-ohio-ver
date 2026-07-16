@@ -42,10 +42,10 @@ public abstract class InGameHudMixin implements IMinecraft {
     @Shadow @Final private static Identifier EFFECT_BACKGROUND_SPRITE;
 
     @Unique private List<MobEffectInstance> krs$sortedEffects;
-    @Unique private Identifier[] krs$effectSprites = new Identifier[8];
-    @Unique private int[] krs$effectIconX = new int[8];
-    @Unique private int[] krs$effectIconY = new int[8];
-    @Unique private float[] krs$effectIconAlpha = new float[8];
+    @Unique private Identifier[] krs$effectSprites;
+    @Unique private int[] krs$effectIconX;
+    @Unique private int[] krs$effectIconY;
+    @Unique private float[] krs$effectIconAlpha;
     @Unique private static final Comparator<MobEffectInstance> KRS_EFFECT_ORDER = Comparator.reverseOrder();
 
     @Inject(method = "extractRenderState", at = @At(value = "HEAD"))
@@ -86,6 +86,10 @@ public abstract class InGameHudMixin implements IMinecraft {
 
         Collection<MobEffectInstance> collection = this.minecraft.player.getActiveEffects();
         if (krs$sortedEffects == null) krs$sortedEffects = new ArrayList<>();
+        if (krs$effectSprites == null) krs$effectSprites = new Identifier[8];
+        if (krs$effectIconX == null) krs$effectIconX = new int[8];
+        if (krs$effectIconY == null) krs$effectIconY = new int[8];
+        if (krs$effectIconAlpha == null) krs$effectIconAlpha = new float[8];
         krs$sortedEffects.clear();
         if (!collection.isEmpty() && (this.minecraft.gui.screen() == null || !this.minecraft.gui.screen().showsActiveEffects())) {
             int i = 0;
