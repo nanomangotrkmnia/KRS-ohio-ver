@@ -41,7 +41,7 @@ public abstract class InGameHudMixin implements IMinecraft {
 
     @Shadow @Final private static Identifier EFFECT_BACKGROUND_SPRITE;
 
-    @Unique private final List<MobEffectInstance> krs$sortedEffects = new ArrayList<>();
+    @Unique private List<MobEffectInstance> krs$sortedEffects;
     @Unique private Identifier[] krs$effectSprites = new Identifier[8];
     @Unique private int[] krs$effectIconX = new int[8];
     @Unique private int[] krs$effectIconY = new int[8];
@@ -85,6 +85,7 @@ public abstract class InGameHudMixin implements IMinecraft {
             return;
 
         Collection<MobEffectInstance> collection = this.minecraft.player.getActiveEffects();
+        if (krs$sortedEffects == null) krs$sortedEffects = new ArrayList<>();
         krs$sortedEffects.clear();
         if (!collection.isEmpty() && (this.minecraft.gui.screen() == null || !this.minecraft.gui.screen().showsActiveEffects())) {
             int i = 0;
