@@ -174,7 +174,7 @@ public class Phase extends Module {
             }
 
             if (mining)
-                player.position().y -= 0.0051;
+                player.position().y -= 0.0042;
 
             if (player.isShiftKeyDown()) {
                 float distance = 0.005f;
