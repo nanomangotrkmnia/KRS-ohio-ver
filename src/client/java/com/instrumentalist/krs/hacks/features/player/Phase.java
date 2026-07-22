@@ -11,8 +11,11 @@ import com.instrumentalist.krs.utils.math.TimerUtil;
 import com.instrumentalist.krs.utils.move.MovementUtil;
 import com.instrumentalist.krs.utils.packet.PacketUtil;
 import com.instrumentalist.krs.utils.value.ListValue;
+import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerActionPacket;
 import net.minecraft.util.Mth;
 import net.minecraft.world.phys.Vec3;
 import org.lwjgl.glfw.GLFW;
@@ -21,11 +24,12 @@ import java.util.Locale;
 
 public class Phase extends Module {
     @Setting
-    private final ListValue mode = new ListValue("Mode", new String[]{"NCP", "AAC 4", "Hypixel"}, "NCP");
+    private final ListValue mode = new ListValue("Mode", new String[]{"NCP", "AAC 4", "Hypixel", "Intave"}, "NCP");
 
     private boolean isClipping = false;
     private final TickTimer phaseTimer = new TickTimer();
     private Float cachedDirection = null;
+    private boolean mining = false;
 
     public Phase() {
         super("Phase", ModuleCategory.Player, GLFW.GLFW_KEY_UNKNOWN, false, true);
@@ -41,6 +45,7 @@ public class Phase extends Module {
         isClipping = false;
         phaseTimer.reset();
         cachedDirection = null;
+        mining = false;
 
         var player = mc.player;
         if (player == null) return;
@@ -155,6 +160,34 @@ public class Phase extends Module {
         var player = mc.player;
         if (player == null) return;
 
+        if (mode.get().equalsIgnoreCase("intave")) {
+            if (mc.options.keyAttack.isDown() && player.getXRot() > 80) {
+                PacketUtil.sendPacket(new ServerboundPlayerActionPacket(
+                        ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK,
+                        player.blockPosition().below(),
+                        Direction.UP
+                ));
+
+                mining = true;
+            } else {
+                mining = false;
+            }
+
+            if (mining)
+                player.position().y -= 0.0042;
+
+            if (player.isShiftKeyDown()) {
+                float distance = 0.005f;
+                double rotation = Math.toRadians(player.getYRot());
+
+                if (mc.options.keyUp.isDown()) move(player, rotation, distance, 1, 1);
+                else if (mc.options.keyDown.isDown()) move(player, rotation, -distance, 1, -1);
+                else if (mc.options.keyLeft.isDown()) move(player, rotation, distance, -1, 1);
+                else if (mc.options.keyRight.isDown()) move(player, rotation, -distance, -1, -1);
+            }
+            return;
+        }
+
         if (mode.get().equalsIgnoreCase("ncp")) {
             if (player.horizontalCollision) isClipping = true;
             if (!isClipping) return;
@@ -186,5 +219,12 @@ public class Phase extends Module {
                     cachedDirection = direction;
             }
         }
+    }
+
+    private void move(LocalPlayer player, double rotation, float distance, int xMultiplier, int zMultiplier) {
+        double xx = Math.cos(rotation) * distance * xMultiplier;
+        double zz = Math.sin(rotation) * distance * zMultiplier;
+
+        player.setPos(player.getX() + xx, player.getY(), player.getZ() + zz);
     }
 }
