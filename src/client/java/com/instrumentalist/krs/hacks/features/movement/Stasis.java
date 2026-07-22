@@ -1,3 +1,6 @@
+//uses blink to stop movement packets, will fix issue with client side movement.
+
+
 package com.instrumentalist.krs.hacks.features.movement;
 
 import com.instrumentalist.krs.hacks.Module;
