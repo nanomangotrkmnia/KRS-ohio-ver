@@ -1,15 +1,10 @@
 package com.instrumentalist.krs.hacks.features.movement.speed.features;
 
 import com.instrumentalist.krs.events.features.*;
-import com.instrumentalist.krs.hacks.ModuleManager;
-import com.instrumentalist.krs.hacks.features.movement.fly.FlyModule;
 import com.instrumentalist.krs.hacks.features.movement.speed.SpeedEvent;
-import com.instrumentalist.krs.hacks.features.movement.speed.SpeedModule;
-import com.instrumentalist.krs.utils.ChatUtil;
 import com.instrumentalist.krs.utils.move.MovementUtil;
 import com.instrumentalist.krs.utils.packet.PacketUtil;
 import net.minecraft.network.protocol.Packet;
-import net.minecraft.network.protocol.game.ClientboundPlayerPositionPacket;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.network.protocol.game.ServerboundPlayerInputPacket;
 import net.minecraft.world.entity.player.Input;

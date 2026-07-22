@@ -53,9 +53,6 @@ public class SpeedModeManager {
             case "miniblox":
                 currentMode = new MinibloxSpeed();
                 break;
-            case "rounding error":
-                currentMode = new RoundingErrorSpeed();
-                break;
             default:
                 currentMode = null;
         }
