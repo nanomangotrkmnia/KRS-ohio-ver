@@ -81,10 +81,7 @@ public class ModuleManager implements EventListener {
                 new OldHitting(), new Freecam(), new ClientCape(), new EntityYawFix(), new MurdererDetector(),
                 new NoHurtCam(), new FastBow(), new FastEat(), new Zoom(), new PathFinder(),
                 new FastBreak(), new ViewModel(), new EntityDesync(), new Step(), new AntiVoid(),
-<<<<<<< HEAD
-=======
                 new Stasis(),
->>>>>>> d0bd8c7 (added stasis lol)
                 new AutoFish(), new NoJumpCooldown(), new AlwaysRiptide(),
                 new WorldTime(), new ChatCommands(), new Rotations(),
                 new PluginsDetector(), new NameTags(), new ESP(), new MovementFix(), new LongThrow(),
