@@ -37,15 +37,22 @@ public class Stasis extends Module {
         ticks = 0;
         var player = mc.player;
         if (player != null) {
+            // Capture current motion and immediately freeze the player to avoid a brief movement burst.
             storedX = player.getDeltaMovement().x;
             storedY = player.getDeltaMovement().y;
             storedZ = player.getDeltaMovement().z;
+            player.setDeltaMovement(0, 0, 0); // ensure instant visual freeze
         }
     }
 
     @Override
     public void onDisable() {
         BlinkUtil.INSTANCE.setLimiter(false);
+        // Reset motion storage and tick counter so no residual motion remains when re-enabled.
+        ticks = 0;
+        storedX = storedY = storedZ = 0.0;
+        // Clear any lingering key inputs to ensure the player stays still on screen.
+        KeyMapping.setAll();
     }
 
     @Override
