@@ -21,7 +21,7 @@ public class SpeedModule extends Module {
     @Setting
     private static final ListValue speedMode = new ListValue(
             "Speed Mode",
-            new String[]{"Vanilla", "Smooth Vanilla", "Hypixel NCP Hop", "Boost", "Flag Boost", "NCP", "Verus", "Vulcan", "Vulcan Old", "Miniblox", "Rounding Error"},
+            new String[]{"Vanilla", "Smooth Vanilla", "Hypixel NCP Hop", "Modern MMC", "Boost", "Flag Boost", "NCP", "Verus", "Vulcan", "Vulcan Old", "Miniblox", "Rounding Error"},
             "Vanilla"
     );
 

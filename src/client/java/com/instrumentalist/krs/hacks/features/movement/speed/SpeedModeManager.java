@@ -29,6 +29,9 @@ public class SpeedModeManager {
             case "hypixel ncp hop":
                 currentMode = new HypixelNCPHopSpeed();
                 break;
+            case "modern mmc":
+                currentMode = new ModernMMCSpeed();
+                break;
             case "boost":
                 currentMode = new BoostSpeed();
                 break;
