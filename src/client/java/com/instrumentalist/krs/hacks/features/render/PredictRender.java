@@ -29,9 +29,19 @@ public class PredictRender extends Module {
     public void onRender3D(Render3DEvent event) {
         int r = range.get();
         if (r <= 0) return;
+        Vec3 prevPos = null;
         for (int i = 1; i <= r; i++) {
-            var pos = MovementUtil.getPredictedPosition(i);
-            // TODO: render the predicted position
+            Vec3 pos = MovementUtil.getPredictedPosition(i);
+            if (prevPos != null) {
+                // Render line between previous and current predicted position
+                GL11.glDisable(GL11.GL_LIGHTING);
+                GL11.glColor4f(1.0f, 0.5f, 0.0f, 1.0f); // orange color
+                GL11.glBegin(GL11.GL_LINES);
+                GL11.glVertex3d(prevPos.x(), prevPos.y(), prevPos.z());
+                GL11.glVertex3d(pos.x(), pos.y(), pos.z());
+                GL11.glEnd();
+            }
+            prevPos = pos;
         }
     }
 }

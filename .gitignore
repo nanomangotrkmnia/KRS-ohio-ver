@@ -5,6 +5,9 @@ build/
 out/
 classes/
 
+/new stuff/
+
+
 # eclipse
 
 *.launch
