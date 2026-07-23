@@ -122,7 +122,10 @@ public class ImguiLoader {
 
         if (GraphicsApiCompatibility.usesCompatibilityRenderer()
                 && !GraphicsApiCompatibility.isLayerActive()) {
-            GraphicsApiCompatibility.renderOffscreenLayer(ImguiLoader::renderFrame);
+            GraphicsApiCompatibility.renderOffscreenLayer(
+                    GraphicsApiCompatibility.Layer.IMGUI,
+                    ImguiLoader::renderFrame
+            );
             return;
         }
 

@@ -228,6 +228,17 @@ public class NanoVGManager implements IMinecraft {
         clearQueues();
     }
 
+    public void discardRenderQueue() {
+        synchronized (renderQueueLock) {
+            renderQueue.clear();
+            frameRenderQueue.clear();
+        }
+    }
+
+    public void discardBeforeGuiRenderQueue() {
+        clearBeforeGuiQueues();
+    }
+
     private void clearQueues() {
         synchronized (renderQueueLock) {
             renderQueue.clear();
@@ -308,9 +319,16 @@ public class NanoVGManager implements IMinecraft {
 
             int width = mc.getWindow().getScreenWidth();
             int height = mc.getWindow().getScreenHeight();
+            int framebufferWidth = mc.getWindow().getWidth();
+            int framebufferHeight = mc.getWindow().getHeight();
+            if (GraphicsApiCompatibility.usesCompatibilityRenderer()
+                    && GraphicsApiCompatibility.isLayerActive()) {
+                framebufferWidth = GraphicsApiCompatibility.getActiveLayerWidth();
+                framebufferHeight = GraphicsApiCompatibility.getActiveLayerHeight();
+            }
             float devicePixelRatio = Math.max(1.0f, Math.max(
-                    mc.getWindow().getWidth() / (float) Math.max(1, width),
-                    mc.getWindow().getHeight() / (float) Math.max(1, height)
+                    framebufferWidth / (float) Math.max(1, width),
+                    framebufferHeight / (float) Math.max(1, height)
             ));
             float uiScale = getUiScale();
 

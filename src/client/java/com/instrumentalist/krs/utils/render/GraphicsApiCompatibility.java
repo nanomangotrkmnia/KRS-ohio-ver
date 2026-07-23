@@ -29,6 +29,8 @@ import org.lwjgl.system.MemoryUtil;
 import org.slf4j.Logger;
 
 import java.nio.ByteBuffer;
+import java.util.EnumMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalDouble;
 
@@ -61,6 +63,26 @@ import static org.lwjgl.glfw.GLFW.glfwWindowHint;
  */
 public final class GraphicsApiCompatibility {
     private static final Logger LOGGER = LogUtils.getLogger();
+    private static final float MAX_SCALED_LAYER_PIXEL_RATIO = 2.0f;
+    private static final long CONTINUOUS_LAYER_TIMEOUT_NANOS = 100_000_000L;
+
+    public enum Layer {
+        NANO_VG(true, 60),
+        NANO_VG_BEFORE_GUI(true, 60),
+        NANO_VG_IMMEDIATE(true, 60),
+        ESP(true, 60),
+        IMGUI(false, 0);
+
+        private final boolean scaled;
+        private final long updateIntervalNanos;
+
+        Layer(boolean scaled, int maximumFramesPerSecond) {
+            this.scaled = scaled;
+            this.updateIntervalNanos = maximumFramesPerSecond <= 0
+                    ? 0L
+                    : 1_000_000_000L / maximumFramesPerSecond;
+        }
+    }
 
     private static final RenderPipeline COMPOSITE_PIPELINE = RenderPipeline.builder()
             .withLocation(Identifier.fromNamespaceAndPath("krs", "pipeline/legacy_ui_composite"))
@@ -74,20 +96,14 @@ public final class GraphicsApiCompatibility {
     private static boolean initialized;
     private static boolean compatibilityRenderer;
     private static boolean layerActive;
+    private static int activeLayerWidth;
+    private static int activeLayerHeight;
 
     private static long offscreenWindow;
     private static GLCapabilities offscreenCapabilities;
-    private static int framebuffer;
-    private static int colorTexture;
-    private static int depthStencilRenderbuffer;
-    private static int framebufferWidth;
-    private static int framebufferHeight;
-    private static ByteBuffer readbackBuffer;
-
-    private static GpuTexture uploadTexture;
-    private static GpuTextureView uploadTextureView;
-    private static int uploadWidth;
-    private static int uploadHeight;
+    private static final OpenGlFramebuffer SCALED_FRAMEBUFFER = new OpenGlFramebuffer();
+    private static final OpenGlFramebuffer NATIVE_FRAMEBUFFER = new OpenGlFramebuffer();
+    private static final Map<Layer, LayerCache> LAYER_CACHES = new EnumMap<>(Layer.class);
 
     private GraphicsApiCompatibility() {
     }
@@ -113,6 +129,14 @@ public final class GraphicsApiCompatibility {
 
     public static boolean isLayerActive() {
         return layerActive;
+    }
+
+    public static int getActiveLayerWidth() {
+        return activeLayerWidth;
+    }
+
+    public static int getActiveLayerHeight() {
+        return activeLayerHeight;
     }
 
     public static void runWithOpenGlContext(Runnable action) {
@@ -148,6 +172,22 @@ public final class GraphicsApiCompatibility {
      * helpers without clearing the layer again.
      */
     public static void renderOffscreenLayer(Runnable renderer) {
+        renderOffscreenLayer(Layer.NANO_VG_IMMEDIATE, renderer, null);
+    }
+
+    public static void renderOffscreenLayer(Layer layer, Runnable renderer) {
+        renderOffscreenLayer(layer, renderer, null);
+    }
+
+    /**
+     * Renders a cached compatibility layer. NanoVG-oriented layers are updated
+     * at most 60 times per second and at a maximum device-pixel ratio of two.
+     * Frames between updates reuse the already uploaded Vulkan texture.
+     *
+     * @param skipped invoked instead of {@code renderer} when a cached frame is
+     *                reused; queue-backed renderers use this to drop stale work
+     */
+    public static void renderOffscreenLayer(Layer layer, Runnable renderer, Runnable skipped) {
         if (renderer == null)
             return;
         if (!usesCompatibilityRenderer()) {
@@ -168,10 +208,50 @@ public final class GraphicsApiCompatibility {
                 || target.getColorTextureView() == null)
             return;
 
-        int width = target.width;
-        int height = target.height;
-        runWithOpenGlContext(() -> renderAndReadBack(width, height, renderer));
-        uploadAndComposite(target, width, height);
+        int[] renderSize = getRenderSize(layer, target.width, target.height);
+        int width = renderSize[0];
+        int height = renderSize[1];
+        LayerCache cache = LAYER_CACHES.computeIfAbsent(layer, ignored -> new LayerCache());
+        long now = System.nanoTime();
+        boolean resumed = cache.lastInvocationNanos == 0L
+                || now - cache.lastInvocationNanos > CONTINUOUS_LAYER_TIMEOUT_NANOS;
+        cache.lastInvocationNanos = now;
+
+        boolean sizeChanged = cache.width != width || cache.height != height;
+        boolean update = layer.updateIntervalNanos == 0L
+                || cache.texture == null
+                || cache.texture.isClosed()
+                || sizeChanged
+                || resumed
+                || now - cache.lastUploadNanos >= layer.updateIntervalNanos;
+
+        OpenGlFramebuffer glFramebuffer = layer.scaled ? SCALED_FRAMEBUFFER : NATIVE_FRAMEBUFFER;
+        if (update) {
+            runWithOpenGlContext(() -> renderAndReadBack(glFramebuffer, width, height, renderer));
+            cache.lastUploadNanos = now;
+        } else if (skipped != null) {
+            skipped.run();
+        }
+
+        uploadAndComposite(target, cache, glFramebuffer, width, height, update);
+    }
+
+    private static int[] getRenderSize(Layer layer, int targetWidth, int targetHeight) {
+        if (!layer.scaled)
+            return new int[]{targetWidth, targetHeight};
+
+        Minecraft minecraft = Minecraft.getInstance();
+        int logicalWidth = Math.max(1, minecraft.getWindow().getScreenWidth());
+        int logicalHeight = Math.max(1, minecraft.getWindow().getScreenHeight());
+        float pixelRatio = Math.max(
+                targetWidth / (float) logicalWidth,
+                targetHeight / (float) logicalHeight
+        );
+        float scale = Math.min(1.0f, MAX_SCALED_LAYER_PIXEL_RATIO / Math.max(1.0f, pixelRatio));
+        return new int[]{
+                Math.max(1, Math.round(targetWidth * scale)),
+                Math.max(1, Math.round(targetHeight * scale))
+        };
     }
 
     private static void createOffscreenContext() {
@@ -219,10 +299,10 @@ public final class GraphicsApiCompatibility {
         }
     }
 
-    private static void renderAndReadBack(int width, int height, Runnable renderer) {
-        ensureOpenGlFramebuffer(width, height);
+    private static void renderAndReadBack(OpenGlFramebuffer target, int width, int height, Runnable renderer) {
+        ensureOpenGlFramebuffer(target, width, height);
 
-        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, framebuffer);
+        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, target.framebuffer);
         try {
             GL11.glViewport(0, 0, width, height);
             GL11.glDisable(GL11.GL_SCISSOR_TEST);
@@ -235,10 +315,14 @@ public final class GraphicsApiCompatibility {
             GL11.glClear(GL11.GL_COLOR_BUFFER_BIT | GL11.GL_DEPTH_BUFFER_BIT | GL11.GL_STENCIL_BUFFER_BIT);
 
             layerActive = true;
+            activeLayerWidth = width;
+            activeLayerHeight = height;
             try {
                 renderer.run();
             } finally {
                 layerActive = false;
+                activeLayerWidth = 0;
+                activeLayerHeight = 0;
             }
 
             int packAlignment = GL11.glGetInteger(GL11.GL_PACK_ALIGNMENT);
@@ -248,10 +332,10 @@ public final class GraphicsApiCompatibility {
                 GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
                 GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 1);
                 GL11.glPixelStorei(GL12.GL_PACK_ROW_LENGTH, 0);
-                readbackBuffer.clear();
-                GL11.glReadPixels(0, 0, width, height, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, readbackBuffer);
-                readbackBuffer.position(0);
-                readbackBuffer.limit(Math.multiplyExact(Math.multiplyExact(width, height), 4));
+                target.readbackBuffer.clear();
+                GL11.glReadPixels(0, 0, width, height, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, target.readbackBuffer);
+                target.readbackBuffer.position(0);
+                target.readbackBuffer.limit(Math.multiplyExact(Math.multiplyExact(width, height), 4));
             } finally {
                 GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, packAlignment);
                 GL11.glPixelStorei(GL12.GL_PACK_ROW_LENGTH, packRowLength);
@@ -259,22 +343,24 @@ public final class GraphicsApiCompatibility {
             }
         } finally {
             layerActive = false;
+            activeLayerWidth = 0;
+            activeLayerHeight = 0;
             GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
         }
     }
 
-    private static void ensureOpenGlFramebuffer(int width, int height) {
-        if (framebuffer != 0 && framebufferWidth == width && framebufferHeight == height)
+    private static void ensureOpenGlFramebuffer(OpenGlFramebuffer target, int width, int height) {
+        if (target.framebuffer != 0 && target.width == width && target.height == height)
             return;
 
-        destroyOpenGlFramebuffer();
+        destroyOpenGlFramebuffer(target);
 
-        framebuffer = GL30.glGenFramebuffers();
-        colorTexture = GL11.glGenTextures();
-        depthStencilRenderbuffer = GL30.glGenRenderbuffers();
+        target.framebuffer = GL30.glGenFramebuffers();
+        target.colorTexture = GL11.glGenTextures();
+        target.depthStencilRenderbuffer = GL30.glGenRenderbuffers();
 
-        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, framebuffer);
-        GL11.glBindTexture(GL11.GL_TEXTURE_2D, colorTexture);
+        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, target.framebuffer);
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, target.colorTexture);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, GL12.GL_CLAMP_TO_EDGE);
@@ -282,12 +368,12 @@ public final class GraphicsApiCompatibility {
         GL11.glTexImage2D(GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA8, width, height, 0,
                 GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, 0L);
         GL30.glFramebufferTexture2D(GL30.GL_FRAMEBUFFER, GL30.GL_COLOR_ATTACHMENT0,
-                GL11.GL_TEXTURE_2D, colorTexture, 0);
+                GL11.GL_TEXTURE_2D, target.colorTexture, 0);
 
-        GL30.glBindRenderbuffer(GL30.GL_RENDERBUFFER, depthStencilRenderbuffer);
+        GL30.glBindRenderbuffer(GL30.GL_RENDERBUFFER, target.depthStencilRenderbuffer);
         GL30.glRenderbufferStorage(GL30.GL_RENDERBUFFER, GL30.GL_DEPTH24_STENCIL8, width, height);
         GL30.glFramebufferRenderbuffer(GL30.GL_FRAMEBUFFER, GL30.GL_DEPTH_STENCIL_ATTACHMENT,
-                GL30.GL_RENDERBUFFER, depthStencilRenderbuffer);
+                GL30.GL_RENDERBUFFER, target.depthStencilRenderbuffer);
         GL11.glDrawBuffer(GL30.GL_COLOR_ATTACHMENT0);
         GL11.glReadBuffer(GL30.GL_COLOR_ATTACHMENT0);
 
@@ -296,22 +382,24 @@ public final class GraphicsApiCompatibility {
         GL30.glBindRenderbuffer(GL30.GL_RENDERBUFFER, 0);
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
         if (status != GL30.GL_FRAMEBUFFER_COMPLETE) {
-            destroyOpenGlFramebuffer();
+            destroyOpenGlFramebuffer(target);
             throw new IllegalStateException("Incomplete Krs compatibility framebuffer: 0x"
                     + Integer.toHexString(status));
         }
 
-        framebufferWidth = width;
-        framebufferHeight = height;
+        target.width = width;
+        target.height = height;
         int requiredBytes = Math.multiplyExact(Math.multiplyExact(width, height), 4);
-        readbackBuffer = MemoryUtil.memAlloc(requiredBytes);
+        target.readbackBuffer = MemoryUtil.memAlloc(requiredBytes);
     }
 
-    private static void uploadAndComposite(RenderTarget target, int width, int height) {
-        ensureUploadTexture(width, height);
+    private static void uploadAndComposite(RenderTarget target, LayerCache cache, OpenGlFramebuffer glFramebuffer,
+                                           int width, int height, boolean upload) {
+        ensureUploadTexture(cache, width, height);
 
         CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
-        encoder.writeToTexture(uploadTexture, readbackBuffer, 0, 0, 0, 0, width, height);
+        if (upload)
+            encoder.writeToTexture(cache.texture, glFramebuffer.readbackBuffer, 0, 0, 0, 0, width, height);
 
         GpuTextureView depthView = target.getDepthTextureView();
         try (RenderPass pass = depthView == null
@@ -319,20 +407,22 @@ public final class GraphicsApiCompatibility {
                 : encoder.createRenderPass(() -> "Krs legacy UI composite", target.getColorTextureView(), Optional.empty(),
                         depthView, OptionalDouble.empty())) {
             pass.setPipeline(COMPOSITE_PIPELINE);
-            pass.bindTexture("InSampler", uploadTextureView,
-                    RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST));
+            pass.bindTexture("InSampler", cache.textureView,
+                    RenderSystem.getSamplerCache().getClampToEdge(
+                            width == target.width && height == target.height ? FilterMode.NEAREST : FilterMode.LINEAR
+                    ));
             pass.draw(3, 1, 0, 0);
         }
     }
 
-    private static void ensureUploadTexture(int width, int height) {
-        if (uploadTexture != null && !uploadTexture.isClosed()
-                && uploadWidth == width && uploadHeight == height)
+    private static void ensureUploadTexture(LayerCache cache, int width, int height) {
+        if (cache.texture != null && !cache.texture.isClosed()
+                && cache.width == width && cache.height == height)
             return;
 
-        destroyUploadTexture();
+        destroyUploadTexture(cache);
         GpuDevice device = RenderSystem.getDevice();
-        uploadTexture = device.createTexture(
+        cache.texture = device.createTexture(
                 "Krs legacy UI upload",
                 GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING,
                 GpuFormat.RGBA8_UNORM,
@@ -341,64 +431,85 @@ public final class GraphicsApiCompatibility {
                 1,
                 1
         );
-        uploadTextureView = device.createTextureView(uploadTexture);
-        uploadWidth = width;
-        uploadHeight = height;
+        cache.textureView = device.createTextureView(cache.texture);
+        cache.width = width;
+        cache.height = height;
     }
 
     public static void shutdown() {
         if (!initialized)
             return;
 
-        destroyUploadTexture();
-        if (compatibilityRenderer && offscreenWindow != 0L) {
-            runWithOpenGlContext(GraphicsApiCompatibility::destroyOpenGlFramebuffer);
-            glfwDestroyWindow(offscreenWindow);
-        }
+        for (LayerCache cache : LAYER_CACHES.values())
+            destroyUploadTexture(cache);
+        LAYER_CACHES.clear();
 
-        if (readbackBuffer != null) {
-            MemoryUtil.memFree(readbackBuffer);
-            readbackBuffer = null;
+        if (compatibilityRenderer && offscreenWindow != 0L) {
+            runWithOpenGlContext(() -> {
+                destroyOpenGlFramebuffer(SCALED_FRAMEBUFFER);
+                destroyOpenGlFramebuffer(NATIVE_FRAMEBUFFER);
+            });
+            glfwDestroyWindow(offscreenWindow);
         }
 
         offscreenWindow = 0L;
         offscreenCapabilities = null;
         compatibilityRenderer = false;
         layerActive = false;
+        activeLayerWidth = 0;
+        activeLayerHeight = 0;
         initialized = false;
     }
 
-    private static void destroyOpenGlFramebuffer() {
-        if (depthStencilRenderbuffer != 0) {
-            GL30.glDeleteRenderbuffers(depthStencilRenderbuffer);
-            depthStencilRenderbuffer = 0;
+    private static void destroyOpenGlFramebuffer(OpenGlFramebuffer target) {
+        if (target.depthStencilRenderbuffer != 0) {
+            GL30.glDeleteRenderbuffers(target.depthStencilRenderbuffer);
+            target.depthStencilRenderbuffer = 0;
         }
-        if (colorTexture != 0) {
-            GL11.glDeleteTextures(colorTexture);
-            colorTexture = 0;
+        if (target.colorTexture != 0) {
+            GL11.glDeleteTextures(target.colorTexture);
+            target.colorTexture = 0;
         }
-        if (framebuffer != 0) {
-            GL30.glDeleteFramebuffers(framebuffer);
-            framebuffer = 0;
+        if (target.framebuffer != 0) {
+            GL30.glDeleteFramebuffers(target.framebuffer);
+            target.framebuffer = 0;
         }
-        if (readbackBuffer != null) {
-            MemoryUtil.memFree(readbackBuffer);
-            readbackBuffer = null;
+        if (target.readbackBuffer != null) {
+            MemoryUtil.memFree(target.readbackBuffer);
+            target.readbackBuffer = null;
         }
-        framebufferWidth = 0;
-        framebufferHeight = 0;
+        target.width = 0;
+        target.height = 0;
     }
 
-    private static void destroyUploadTexture() {
-        if (uploadTextureView != null) {
-            uploadTextureView.close();
-            uploadTextureView = null;
+    private static void destroyUploadTexture(LayerCache cache) {
+        if (cache.textureView != null) {
+            cache.textureView.close();
+            cache.textureView = null;
         }
-        if (uploadTexture != null) {
-            uploadTexture.close();
-            uploadTexture = null;
+        if (cache.texture != null) {
+            cache.texture.close();
+            cache.texture = null;
         }
-        uploadWidth = 0;
-        uploadHeight = 0;
+        cache.width = 0;
+        cache.height = 0;
+    }
+
+    private static final class OpenGlFramebuffer {
+        private int framebuffer;
+        private int colorTexture;
+        private int depthStencilRenderbuffer;
+        private int width;
+        private int height;
+        private ByteBuffer readbackBuffer;
+    }
+
+    private static final class LayerCache {
+        private GpuTexture texture;
+        private GpuTextureView textureView;
+        private int width;
+        private int height;
+        private long lastUploadNanos;
+        private long lastInvocationNanos;
     }
 }

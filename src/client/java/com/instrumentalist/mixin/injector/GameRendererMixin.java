@@ -121,7 +121,11 @@ public abstract class GameRendererMixin implements DebugOverlayRenderer, IMinecr
 
         if (GraphicsApiCompatibility.usesCompatibilityRenderer()) {
             if (Client.nanoVgManager.hasQueuedBeforeGuiRenderers())
-                GraphicsApiCompatibility.renderOffscreenLayer(Client.nanoVgManager::renderQueuedBeforeGui);
+                GraphicsApiCompatibility.renderOffscreenLayer(
+                        GraphicsApiCompatibility.Layer.NANO_VG_BEFORE_GUI,
+                        Client.nanoVgManager::renderQueuedBeforeGui,
+                        Client.nanoVgManager::discardBeforeGuiRenderQueue
+                );
         } else {
             Client.nanoVgManager.renderQueuedBeforeGui();
         }

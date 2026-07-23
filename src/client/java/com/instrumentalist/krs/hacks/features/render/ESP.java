@@ -268,7 +268,10 @@ public class ESP extends Module {
 
         if (GraphicsApiCompatibility.usesCompatibilityRenderer()) {
             renderedCaptureId = captureId;
-            GraphicsApiCompatibility.renderOffscreenLayer(() -> drawCapturedShadow(0, 0, 0, 0));
+            GraphicsApiCompatibility.renderOffscreenLayer(
+                    GraphicsApiCompatibility.Layer.ESP,
+                    () -> drawCapturedShadow(0, 0, 0, 0)
+            );
             return;
         }
 

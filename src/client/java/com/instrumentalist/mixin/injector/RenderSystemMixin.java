@@ -48,10 +48,14 @@ public abstract class RenderSystemMixin implements IMinecraft {
             if (Client.nanoVgManager != null
                     && (Client.nanoVgManager.hasQueuedRenderers()
                     || CustomTitleScreen.shouldRenderStartupLoadBar())) {
-                GraphicsApiCompatibility.renderOffscreenLayer(() -> {
-                    Client.nanoVgManager.renderQueued();
-                    CustomTitleScreen.renderStartupLoadBarIfNeeded(Client.nanoVgManager);
-                });
+                GraphicsApiCompatibility.renderOffscreenLayer(
+                        GraphicsApiCompatibility.Layer.NANO_VG,
+                        () -> {
+                            Client.nanoVgManager.renderQueued();
+                            CustomTitleScreen.renderStartupLoadBarIfNeeded(Client.nanoVgManager);
+                        },
+                        Client.nanoVgManager::discardRenderQueue
+                );
             }
         } else if (Client.nanoVgManager != null) {
             Client.nanoVgManager.renderQueued();
@@ -64,7 +68,10 @@ public abstract class RenderSystemMixin implements IMinecraft {
 
         if (GraphicsApiCompatibility.usesCompatibilityRenderer()) {
             if (ImguiLoader.shouldRenderFrame())
-                GraphicsApiCompatibility.renderOffscreenLayer(ImguiLoader::onFrameRender);
+                GraphicsApiCompatibility.renderOffscreenLayer(
+                        GraphicsApiCompatibility.Layer.IMGUI,
+                        ImguiLoader::onFrameRender
+                );
         } else {
             ImguiLoader.onFrameRender();
         }
