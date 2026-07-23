@@ -2,6 +2,9 @@ package com.instrumentalist.krs.utils.render;
 
 import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.PrimitiveTopology;
+import com.mojang.blaze3d.buffers.GpuBuffer;
+import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.blaze3d.buffers.GpuFence;
 import com.mojang.blaze3d.opengl.GlDevice;
 import com.mojang.blaze3d.pipeline.BlendFunction;
 import com.mojang.blaze3d.pipeline.ColorTargetState;
@@ -24,6 +27,7 @@ import org.lwjgl.opengl.GL12;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL21;
 import org.lwjgl.opengl.GL30;
+import org.lwjgl.opengl.GL32;
 import org.lwjgl.opengl.GLCapabilities;
 import org.lwjgl.system.MemoryUtil;
 import org.slf4j.Logger;
@@ -33,6 +37,10 @@ import java.util.EnumMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalDouble;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 
 import static org.lwjgl.glfw.GLFW.GLFW_CLIENT_API;
 import static org.lwjgl.glfw.GLFW.GLFW_CONTEXT_VERSION_MAJOR;
@@ -65,13 +73,18 @@ public final class GraphicsApiCompatibility {
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final float MAX_SCALED_LAYER_PIXEL_RATIO = 2.0f;
     private static final long CONTINUOUS_LAYER_TIMEOUT_NANOS = 100_000_000L;
+    private static final int TRANSFER_SLOT_COUNT = 2;
+    private static final int TRANSFER_FREE = 0;
+    private static final int TRANSFER_COPYING = 1;
+    private static final int TRANSFER_READY = 2;
+    private static final int TRANSFER_GPU_IN_FLIGHT = 3;
 
     public enum Layer {
         NANO_VG(true, 60),
         NANO_VG_BEFORE_GUI(true, 60),
         NANO_VG_IMMEDIATE(true, 60),
         ESP(true, 60),
-        IMGUI(false, 0);
+        IMGUI(false, 60);
 
         private final boolean scaled;
         private final long updateIntervalNanos;
@@ -104,6 +117,8 @@ public final class GraphicsApiCompatibility {
     private static final OpenGlFramebuffer SCALED_FRAMEBUFFER = new OpenGlFramebuffer();
     private static final OpenGlFramebuffer NATIVE_FRAMEBUFFER = new OpenGlFramebuffer();
     private static final Map<Layer, LayerCache> LAYER_CACHES = new EnumMap<>(Layer.class);
+    private static ExecutorService transferExecutor;
+    private static long lastTransferFailureLogNanos;
 
     private GraphicsApiCompatibility() {
     }
@@ -116,6 +131,11 @@ public final class GraphicsApiCompatibility {
         compatibilityRenderer = !(device.backend instanceof GlDevice);
         if (compatibilityRenderer) {
             createOffscreenContext();
+            transferExecutor = Executors.newSingleThreadExecutor(task -> {
+                Thread thread = new Thread(task, "Krs compatibility transfer");
+                thread.setDaemon(true);
+                return thread;
+            });
             LOGGER.info("Krs legacy UI compatibility renderer enabled for graphics backend {}",
                     device.getDeviceInfo().backendName());
         }
@@ -213,27 +233,39 @@ public final class GraphicsApiCompatibility {
         int height = renderSize[1];
         LayerCache cache = LAYER_CACHES.computeIfAbsent(layer, ignored -> new LayerCache());
         long now = System.nanoTime();
+        boolean sizeChanged = cache.width != width || cache.height != height;
+        if (sizeChanged)
+            resetLayerCache(cache, width, height);
+
         boolean resumed = cache.lastInvocationNanos == 0L
                 || now - cache.lastInvocationNanos > CONTINUOUS_LAYER_TIMEOUT_NANOS;
         cache.lastInvocationNanos = now;
+        if (resumed && !sizeChanged)
+            invalidateLayerCache(cache);
 
-        boolean sizeChanged = cache.width != width || cache.height != height;
-        boolean update = layer.updateIntervalNanos == 0L
-                || cache.texture == null
-                || cache.texture.isClosed()
-                || sizeChanged
-                || resumed
-                || now - cache.lastUploadNanos >= layer.updateIntervalNanos;
+        reclaimGpuTransfers(cache);
+        uploadNewestReadyTransfer(cache);
+
+        boolean update = cache.lastRenderNanos == 0L
+                || layer.updateIntervalNanos == 0L
+                || now - cache.lastRenderNanos >= layer.updateIntervalNanos;
 
         OpenGlFramebuffer glFramebuffer = layer.scaled ? SCALED_FRAMEBUFFER : NATIVE_FRAMEBUFFER;
+        boolean rendered = false;
         if (update) {
-            runWithOpenGlContext(() -> renderAndReadBack(glFramebuffer, width, height, renderer));
-            cache.lastUploadNanos = now;
-        } else if (skipped != null) {
-            skipped.run();
+            boolean[] issued = new boolean[1];
+            runWithOpenGlContext(() -> issued[0] = advanceReadbackPipeline(
+                    glFramebuffer, cache, width, height, renderer
+            ));
+            rendered = issued[0];
+            if (rendered)
+                cache.lastRenderNanos = now;
         }
 
-        uploadAndComposite(target, cache, glFramebuffer, width, height, update);
+        if (!rendered && skipped != null)
+            skipped.run();
+
+        compositeCachedLayer(target, cache, width, height);
     }
 
     private static int[] getRenderSize(Layer layer, int targetWidth, int targetHeight) {
@@ -299,9 +331,23 @@ public final class GraphicsApiCompatibility {
         }
     }
 
-    private static void renderAndReadBack(OpenGlFramebuffer target, int width, int height, Runnable renderer) {
-        ensureOpenGlFramebuffer(target, width, height);
+    private static boolean advanceReadbackPipeline(OpenGlFramebuffer target, LayerCache cache,
+                                                   int width, int height, Runnable renderer) {
+        reclaimFinishedReadbackCopies(cache);
+        dispatchLatestCompletedReadback(cache);
 
+        ReadbackSlot slot = findFreeReadbackSlot(cache);
+        if (slot == null)
+            return false;
+
+        ensureOpenGlFramebuffer(target, width, height);
+        ensureReadbackBuffer(slot, cache.byteCount);
+        renderAndQueueReadback(target, cache, slot, width, height, renderer);
+        return true;
+    }
+
+    private static void renderAndQueueReadback(OpenGlFramebuffer target, LayerCache cache, ReadbackSlot slot,
+                                               int width, int height, Runnable renderer) {
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, target.framebuffer);
         try {
             GL11.glViewport(0, 0, width, height);
@@ -329,13 +375,14 @@ public final class GraphicsApiCompatibility {
             int packRowLength = GL11.glGetInteger(GL12.GL_PACK_ROW_LENGTH);
             int pixelPackBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
             try {
-                GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
+                GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, slot.buffer);
                 GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 1);
                 GL11.glPixelStorei(GL12.GL_PACK_ROW_LENGTH, 0);
-                target.readbackBuffer.clear();
-                GL11.glReadPixels(0, 0, width, height, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, target.readbackBuffer);
-                target.readbackBuffer.position(0);
-                target.readbackBuffer.limit(Math.multiplyExact(Math.multiplyExact(width, height), 4));
+                GL11.glReadPixels(0, 0, width, height, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, 0L);
+                slot.fence = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                slot.sequence = ++cache.nextSequence;
+                slot.generation = cache.generation;
+                GL11.glFlush();
             } finally {
                 GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, packAlignment);
                 GL11.glPixelStorei(GL12.GL_PACK_ROW_LENGTH, packRowLength);
@@ -347,6 +394,156 @@ public final class GraphicsApiCompatibility {
             activeLayerHeight = 0;
             GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
         }
+    }
+
+    private static void dispatchLatestCompletedReadback(LayerCache cache) {
+        TransferSlot transfer = findFreeTransferSlot(cache);
+        if (transfer == null)
+            return;
+
+        ReadbackSlot newest = null;
+        for (ReadbackSlot slot : cache.readbackSlots) {
+            if (slot.fence == 0L)
+                continue;
+
+            int status = GL32.glClientWaitSync(slot.fence, 0, 0L);
+            if (status == GL32.GL_TIMEOUT_EXPIRED)
+                continue;
+            if (status == GL32.GL_WAIT_FAILED) {
+                releaseSignaledReadback(slot);
+                logTransferFailure(new IllegalStateException("OpenGL failed to poll a compatibility readback fence"));
+                continue;
+            }
+
+            if (slot.generation != cache.generation) {
+                releaseSignaledReadback(slot);
+                continue;
+            }
+
+            if (newest == null || slot.sequence > newest.sequence) {
+                if (newest != null)
+                    releaseSignaledReadback(newest);
+                newest = slot;
+            } else {
+                releaseSignaledReadback(slot);
+            }
+        }
+
+        if (newest == null)
+            return;
+
+        int previousBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
+        GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, newest.buffer);
+        ByteBuffer mapped = GL30.glMapBufferRange(
+                GL21.GL_PIXEL_PACK_BUFFER, 0L, cache.byteCount, GL30.GL_MAP_READ_BIT
+        );
+        GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, previousBuffer);
+        releaseReadbackFence(newest);
+        if (mapped == null) {
+            logTransferFailure(new IllegalStateException("Could not map a completed OpenGL compatibility readback"));
+            return;
+        }
+
+        ReadbackSlot readback = newest;
+        readback.mappedBuffer = mapped;
+        readback.copyComplete = false;
+        transfer.sequence = readback.sequence;
+        transfer.generation = readback.generation;
+        transfer.state = TRANSFER_COPYING;
+
+        ExecutorService executor = transferExecutor;
+        try {
+            readback.copyTask = executor.submit(() -> copyReadbackOnWorker(cache, readback, transfer));
+        } catch (RejectedExecutionException exception) {
+            transfer.state = TRANSFER_FREE;
+            readback.copyComplete = true;
+            logTransferFailure(exception);
+        }
+    }
+
+    private static void copyReadbackOnWorker(LayerCache cache, ReadbackSlot readback, TransferSlot transfer) {
+        try {
+            MemoryUtil.memCopy(
+                    MemoryUtil.memAddress(readback.mappedBuffer),
+                    MemoryUtil.memAddress(transfer.mapping.data()),
+                    cache.byteCount
+            );
+            transfer.state = TRANSFER_READY;
+        } catch (Throwable failure) {
+            transfer.state = TRANSFER_FREE;
+            logTransferFailure(failure);
+        } finally {
+            readback.copyComplete = true;
+        }
+    }
+
+    private static void reclaimFinishedReadbackCopies(LayerCache cache) {
+        int previousBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
+        try {
+            for (ReadbackSlot slot : cache.readbackSlots) {
+                if (slot.mappedBuffer == null || !slot.copyComplete)
+                    continue;
+
+                GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, slot.buffer);
+                if (!GL15.glUnmapBuffer(GL21.GL_PIXEL_PACK_BUFFER))
+                    logTransferFailure(new IllegalStateException("OpenGL compatibility readback data became corrupt"));
+                slot.mappedBuffer = null;
+                slot.copyTask = null;
+                slot.copyComplete = false;
+                slot.sequence = 0L;
+                slot.generation = 0L;
+            }
+        } finally {
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, previousBuffer);
+        }
+    }
+
+    private static ReadbackSlot findFreeReadbackSlot(LayerCache cache) {
+        for (ReadbackSlot slot : cache.readbackSlots) {
+            if (slot.fence == 0L && slot.mappedBuffer == null)
+                return slot;
+        }
+        return null;
+    }
+
+    private static TransferSlot findFreeTransferSlot(LayerCache cache) {
+        for (TransferSlot slot : cache.transferSlots) {
+            if (slot.state == TRANSFER_FREE)
+                return slot;
+        }
+        return null;
+    }
+
+    private static void releaseSignaledReadback(ReadbackSlot slot) {
+        releaseReadbackFence(slot);
+        slot.sequence = 0L;
+        slot.generation = 0L;
+    }
+
+    private static void releaseReadbackFence(ReadbackSlot slot) {
+        if (slot.fence != 0L) {
+            GL32.glDeleteSync(slot.fence);
+            slot.fence = 0L;
+        }
+    }
+
+    private static void ensureReadbackBuffer(ReadbackSlot slot, int byteCount) {
+        if (slot.buffer != 0)
+            return;
+
+        int previousBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
+        slot.buffer = GL15.glGenBuffers();
+        GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, slot.buffer);
+        GL15.glBufferData(GL21.GL_PIXEL_PACK_BUFFER, byteCount, GL15.GL_STREAM_READ);
+        GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, previousBuffer);
+    }
+
+    private static synchronized void logTransferFailure(Throwable failure) {
+        long now = System.nanoTime();
+        if (lastTransferFailureLogNanos != 0L && now - lastTransferFailureLogNanos < 10_000_000_000L)
+            return;
+        lastTransferFailureLogNanos = now;
+        LOGGER.error("Failed to transfer a legacy UI frame without blocking the render thread", failure);
     }
 
     private static void ensureOpenGlFramebuffer(OpenGlFramebuffer target, int width, int height) {
@@ -389,25 +586,141 @@ public final class GraphicsApiCompatibility {
 
         target.width = width;
         target.height = height;
-        int requiredBytes = Math.multiplyExact(Math.multiplyExact(width, height), 4);
-        target.readbackBuffer = MemoryUtil.memAlloc(requiredBytes);
     }
 
-    private static void uploadAndComposite(RenderTarget target, LayerCache cache, OpenGlFramebuffer glFramebuffer,
-                                           int width, int height, boolean upload) {
-        ensureUploadTexture(cache, width, height);
+    private static void resetLayerCache(LayerCache cache, int width, int height) {
+        awaitWorkerCopies(cache);
+        runWithOpenGlContext(() -> destroyReadbackResources(cache));
+        destroyTransferResources(cache);
+        destroyUploadTextures(cache);
+
+        cache.width = width;
+        cache.height = height;
+        cache.byteCount = Math.multiplyExact(Math.multiplyExact(width, height), 4);
+        cache.generation++;
+        cache.nextSequence = 0L;
+        cache.lastRenderNanos = 0L;
+        cache.activeTextureIndex = -1;
+
+        ensureTransferResources(cache);
+        ensureUploadTextures(cache);
+    }
+
+    private static void invalidateLayerCache(LayerCache cache) {
+        cache.generation++;
+        cache.lastRenderNanos = 0L;
+        cache.activeTextureIndex = -1;
+    }
+
+    private static void ensureTransferResources(LayerCache cache) {
+        GpuDevice device = RenderSystem.getDevice();
+        int usage = GpuBuffer.USAGE_MAP_WRITE
+                | GpuBuffer.USAGE_HINT_CLIENT_STORAGE
+                | GpuBuffer.USAGE_COPY_SRC;
+        for (int index = 0; index < cache.transferSlots.length; index++) {
+            TransferSlot slot = cache.transferSlots[index];
+            if (slot.buffer != null && !slot.buffer.isClosed())
+                continue;
+
+            int slotIndex = index;
+            slot.buffer = device.createBuffer(
+                    () -> "Krs legacy UI staging " + slotIndex,
+                    usage,
+                    cache.byteCount
+            );
+            slot.mapping = slot.buffer.map(false, true);
+            slot.state = TRANSFER_FREE;
+        }
+    }
+
+    private static void ensureUploadTextures(LayerCache cache) {
+        boolean valid = true;
+        for (GpuTexture texture : cache.textures)
+            valid &= texture != null && !texture.isClosed();
+        if (valid)
+            return;
+
+        destroyUploadTextures(cache);
+        GpuDevice device = RenderSystem.getDevice();
+        for (int index = 0; index < cache.textures.length; index++) {
+            cache.textures[index] = device.createTexture(
+                    "Krs legacy UI upload " + index,
+                    GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING,
+                    GpuFormat.RGBA8_UNORM,
+                    cache.width,
+                    cache.height,
+                    1,
+                    1
+            );
+            cache.textureViews[index] = device.createTextureView(cache.textures[index]);
+        }
+    }
+
+    private static void reclaimGpuTransfers(LayerCache cache) {
+        for (TransferSlot slot : cache.transferSlots) {
+            if (slot.state != TRANSFER_GPU_IN_FLIGHT)
+                continue;
+
+            GpuFence fence = slot.gpuFence;
+            if (fence != null && !fence.awaitCompletion(0L))
+                continue;
+
+            if (fence != null)
+                fence.close();
+            slot.gpuFence = null;
+            slot.state = TRANSFER_FREE;
+        }
+    }
+
+    private static void uploadNewestReadyTransfer(LayerCache cache) {
+        TransferSlot newest = null;
+        for (TransferSlot slot : cache.transferSlots) {
+            if (slot.state != TRANSFER_READY)
+                continue;
+            if (slot.generation != cache.generation) {
+                slot.state = TRANSFER_FREE;
+                continue;
+            }
+            if (newest == null || slot.sequence > newest.sequence) {
+                if (newest != null)
+                    newest.state = TRANSFER_FREE;
+                newest = slot;
+            } else {
+                slot.state = TRANSFER_FREE;
+            }
+        }
+
+        if (newest == null)
+            return;
+
+        ensureUploadTextures(cache);
+        int textureIndex = (cache.activeTextureIndex + 1) % cache.textures.length;
+        CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
+        encoder.copyBufferToTexture(
+                newest.buffer.slice(),
+                0, 0, cache.width, cache.height,
+                cache.textures[textureIndex],
+                0, 0, cache.width, cache.height,
+                0, 0
+        );
+        newest.gpuFence = encoder.createFence();
+        newest.state = TRANSFER_GPU_IN_FLIGHT;
+        cache.activeTextureIndex = textureIndex;
+    }
+
+    private static void compositeCachedLayer(RenderTarget target, LayerCache cache, int width, int height) {
+        int textureIndex = cache.activeTextureIndex;
+        if (textureIndex < 0)
+            return;
 
         CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
-        if (upload)
-            encoder.writeToTexture(cache.texture, glFramebuffer.readbackBuffer, 0, 0, 0, 0, width, height);
-
         GpuTextureView depthView = target.getDepthTextureView();
         try (RenderPass pass = depthView == null
                 ? encoder.createRenderPass(() -> "Krs legacy UI composite", target.getColorTextureView(), Optional.empty())
                 : encoder.createRenderPass(() -> "Krs legacy UI composite", target.getColorTextureView(), Optional.empty(),
                         depthView, OptionalDouble.empty())) {
             pass.setPipeline(COMPOSITE_PIPELINE);
-            pass.bindTexture("InSampler", cache.textureView,
+            pass.bindTexture("InSampler", cache.textureViews[textureIndex],
                     RenderSystem.getSamplerCache().getClampToEdge(
                             width == target.width && height == target.height ? FilterMode.NEAREST : FilterMode.LINEAR
                     ));
@@ -415,45 +728,54 @@ public final class GraphicsApiCompatibility {
         }
     }
 
-    private static void ensureUploadTexture(LayerCache cache, int width, int height) {
-        if (cache.texture != null && !cache.texture.isClosed()
-                && cache.width == width && cache.height == height)
-            return;
-
-        destroyUploadTexture(cache);
-        GpuDevice device = RenderSystem.getDevice();
-        cache.texture = device.createTexture(
-                "Krs legacy UI upload",
-                GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING,
-                GpuFormat.RGBA8_UNORM,
-                width,
-                height,
-                1,
-                1
-        );
-        cache.textureView = device.createTextureView(cache.texture);
-        cache.width = width;
-        cache.height = height;
+    private static void awaitWorkerCopies(LayerCache cache) {
+        for (ReadbackSlot slot : cache.readbackSlots) {
+            Future<?> task = slot.copyTask;
+            if (task == null)
+                continue;
+            try {
+                task.get();
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while draining compatibility transfers", exception);
+            } catch (Exception exception) {
+                logTransferFailure(exception);
+            }
+        }
     }
 
     public static void shutdown() {
         if (!initialized)
             return;
 
+        ExecutorService executor = transferExecutor;
+        if (executor != null)
+            executor.shutdown();
+
         for (LayerCache cache : LAYER_CACHES.values())
-            destroyUploadTexture(cache);
-        LAYER_CACHES.clear();
+            awaitWorkerCopies(cache);
 
         if (compatibilityRenderer && offscreenWindow != 0L) {
             runWithOpenGlContext(() -> {
+                for (LayerCache cache : LAYER_CACHES.values())
+                    destroyReadbackResources(cache);
                 destroyOpenGlFramebuffer(SCALED_FRAMEBUFFER);
                 destroyOpenGlFramebuffer(NATIVE_FRAMEBUFFER);
             });
             glfwDestroyWindow(offscreenWindow);
         }
 
+        for (LayerCache cache : LAYER_CACHES.values()) {
+            destroyTransferResources(cache);
+            destroyUploadTextures(cache);
+        }
+        LAYER_CACHES.clear();
+        if (executor != null)
+            executor.shutdownNow();
+
         offscreenWindow = 0L;
         offscreenCapabilities = null;
+        transferExecutor = null;
         compatibilityRenderer = false;
         layerActive = false;
         activeLayerWidth = 0;
@@ -474,25 +796,66 @@ public final class GraphicsApiCompatibility {
             GL30.glDeleteFramebuffers(target.framebuffer);
             target.framebuffer = 0;
         }
-        if (target.readbackBuffer != null) {
-            MemoryUtil.memFree(target.readbackBuffer);
-            target.readbackBuffer = null;
-        }
         target.width = 0;
         target.height = 0;
     }
 
-    private static void destroyUploadTexture(LayerCache cache) {
-        if (cache.textureView != null) {
-            cache.textureView.close();
-            cache.textureView = null;
+    private static void destroyReadbackResources(LayerCache cache) {
+        int previousBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
+        try {
+            for (ReadbackSlot slot : cache.readbackSlots) {
+                releaseReadbackFence(slot);
+                if (slot.mappedBuffer != null) {
+                    GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, slot.buffer);
+                    GL15.glUnmapBuffer(GL21.GL_PIXEL_PACK_BUFFER);
+                    slot.mappedBuffer = null;
+                }
+                if (slot.buffer != 0) {
+                    GL15.glDeleteBuffers(slot.buffer);
+                    slot.buffer = 0;
+                }
+                slot.copyTask = null;
+                slot.copyComplete = false;
+                slot.sequence = 0L;
+                slot.generation = 0L;
+            }
+        } finally {
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, previousBuffer);
         }
-        if (cache.texture != null) {
-            cache.texture.close();
-            cache.texture = null;
+    }
+
+    private static void destroyTransferResources(LayerCache cache) {
+        for (TransferSlot slot : cache.transferSlots) {
+            if (slot.gpuFence != null) {
+                slot.gpuFence.close();
+                slot.gpuFence = null;
+            }
+            if (slot.mapping != null) {
+                slot.mapping.close();
+                slot.mapping = null;
+            }
+            if (slot.buffer != null) {
+                slot.buffer.close();
+                slot.buffer = null;
+            }
+            slot.state = TRANSFER_FREE;
+            slot.sequence = 0L;
+            slot.generation = 0L;
         }
-        cache.width = 0;
-        cache.height = 0;
+    }
+
+    private static void destroyUploadTextures(LayerCache cache) {
+        for (int index = 0; index < cache.textures.length; index++) {
+            if (cache.textureViews[index] != null) {
+                cache.textureViews[index].close();
+                cache.textureViews[index] = null;
+            }
+            if (cache.textures[index] != null) {
+                cache.textures[index].close();
+                cache.textures[index] = null;
+            }
+        }
+        cache.activeTextureIndex = -1;
     }
 
     private static final class OpenGlFramebuffer {
@@ -501,15 +864,46 @@ public final class GraphicsApiCompatibility {
         private int depthStencilRenderbuffer;
         private int width;
         private int height;
-        private ByteBuffer readbackBuffer;
+    }
+
+    private static final class ReadbackSlot {
+        private int buffer;
+        private long fence;
+        private long sequence;
+        private long generation;
+        private ByteBuffer mappedBuffer;
+        private Future<?> copyTask;
+        private volatile boolean copyComplete;
+    }
+
+    private static final class TransferSlot {
+        private GpuBuffer buffer;
+        private GpuBufferSlice.MappedView mapping;
+        private GpuFence gpuFence;
+        private long sequence;
+        private long generation;
+        private volatile int state = TRANSFER_FREE;
     }
 
     private static final class LayerCache {
-        private GpuTexture texture;
-        private GpuTextureView textureView;
+        private final ReadbackSlot[] readbackSlots = new ReadbackSlot[TRANSFER_SLOT_COUNT];
+        private final TransferSlot[] transferSlots = new TransferSlot[TRANSFER_SLOT_COUNT];
+        private final GpuTexture[] textures = new GpuTexture[TRANSFER_SLOT_COUNT];
+        private final GpuTextureView[] textureViews = new GpuTextureView[TRANSFER_SLOT_COUNT];
         private int width;
         private int height;
-        private long lastUploadNanos;
+        private int byteCount;
+        private int activeTextureIndex = -1;
+        private long generation;
+        private long nextSequence;
+        private long lastRenderNanos;
         private long lastInvocationNanos;
+
+        private LayerCache() {
+            for (int index = 0; index < TRANSFER_SLOT_COUNT; index++) {
+                readbackSlots[index] = new ReadbackSlot();
+                transferSlots[index] = new TransferSlot();
+            }
+        }
     }
 }
