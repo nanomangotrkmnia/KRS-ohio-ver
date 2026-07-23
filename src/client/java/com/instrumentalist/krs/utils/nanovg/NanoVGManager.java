@@ -1,6 +1,7 @@
 package com.instrumentalist.krs.utils.nanovg;
 
 import com.instrumentalist.krs.utils.IMinecraft;
+import com.instrumentalist.krs.utils.render.GraphicsApiCompatibility;
 import com.mojang.logging.LogUtils;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.opengl.GL13;
@@ -197,7 +198,25 @@ public class NanoVGManager implements IMinecraft {
         if (instance == null || !instance.isCreated())
             return;
 
+        if (GraphicsApiCompatibility.usesCompatibilityRenderer()
+                && !GraphicsApiCompatibility.isLayerActive()) {
+            GraphicsApiCompatibility.renderOffscreenLayer(() -> renderNow(vg));
+            return;
+        }
+
         renderNow(vg);
+    }
+
+    public boolean hasQueuedRenderers() {
+        synchronized (renderQueueLock) {
+            return !renderQueue.isEmpty() || !frameRenderQueue.isEmpty();
+        }
+    }
+
+    public boolean hasQueuedBeforeGuiRenderers() {
+        synchronized (renderQueueLock) {
+            return !beforeGuiRenderQueue.isEmpty() || !beforeGuiFrameRenderQueue.isEmpty();
+        }
     }
 
     public void shutdown() {

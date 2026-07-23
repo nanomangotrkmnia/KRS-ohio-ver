@@ -269,7 +269,7 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
         manager.renderImmediate(CustomTitleScreen::renderStartupLoadBar);
     }
 
-    private static boolean shouldRenderStartupLoadBar() {
+    public static boolean shouldRenderStartupLoadBar() {
         return mc.gui.screen() instanceof CustomTitleScreen && mc.gui.overlay() != null;
     }
 
