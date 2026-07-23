@@ -1,16 +1,14 @@
-//uses blink to stop movement packets, will fix issue with client side movement.
-
-
 package com.instrumentalist.krs.hacks.features.movement;
 
+import com.instrumentalist.krs.events.features.SendPacketEvent;
+import com.instrumentalist.krs.events.features.UpdateEvent;
 import com.instrumentalist.krs.hacks.Module;
 import com.instrumentalist.krs.hacks.ModuleCategory;
-import com.instrumentalist.krs.utils.value.BooleanValue;
-import com.instrumentalist.krs.events.features.UpdateEvent;
-import net.minecraft.client.KeyMapping;
-import com.instrumentalist.krs.events.features.SendPacketEvent;
 import com.instrumentalist.krs.utils.packet.BlinkUtil;
+import com.instrumentalist.krs.utils.value.BooleanValue;
+import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.world.phys.Vec3;
 import org.lwjgl.glfw.GLFW;
 
 public class Stasis extends Module {
@@ -24,11 +22,10 @@ public class Stasis extends Module {
     private final BooleanValue stopZ = new BooleanValue("Stop Z", true);
 
     @Setting
-    private final BooleanValue cancelPlayerMovement = new BooleanValue("Cancel Player Movement / Inputs", true);
+    private final BooleanValue cancelPlayerMovement = new BooleanValue("Cancel Player Movement", true);
 
-    // Store motion to maintain while frozen and tick counter for periodic refresh
-    private int ticks = 0;
-    private double storedX, storedY, storedZ;
+    private int ticksSinceMotionRefresh;
+    private Vec3 storedMovement = Vec3.ZERO;
 
     public Stasis() {
         super("Stasis", ModuleCategory.Movement, GLFW.GLFW_KEY_UNKNOWN, false, true);
@@ -36,85 +33,85 @@ public class Stasis extends Module {
 
     @Override
     public void onEnable() {
-        BlinkUtil.INSTANCE.setLimiter(false);
-        ticks = 0;
-        var player = mc.player;
-        if (player != null) {
+        if (mc.level == null) return;
 
-            // Capture current motion and immediately freeze the player to avoid a brief movement burst.
-            storedX = player.getDeltaMovement().x;
-            storedY = player.getDeltaMovement().y;
-            storedZ = player.getDeltaMovement().z;
-            player.setDeltaMovement(0, 0, 0); // ensure instant visual freeze
-            storedX = player.getDeltaMovement().x;
-            storedY = player.getDeltaMovement().y;
-            storedZ = player.getDeltaMovement().z;
-        }
+        BlinkUtil.INSTANCE.setLimiter(false);
+        ticksSinceMotionRefresh = 0;
+
+        LocalPlayer player = mc.player;
+        if (player == null) return;
+
+        player.setDeltaMovement(Vec3.ZERO);
+        storedMovement = player.getDeltaMovement();
     }
 
     @Override
     public void onDisable() {
-        BlinkUtil.INSTANCE.setLimiter(false);
+        resetMotionState();
 
-        // Reset motion storage and tick counter so no residual motion remains when re-enabled.
-        ticks = 0;
-        storedX = storedY = storedZ = 0.0;
-        // Clear any lingering key inputs to ensure the player stays still on screen.
-        KeyMapping.setAll();
+        if (mc.level != null) {
+            BlinkUtil.INSTANCE.setLimiter(false);
+        }
     }
 
     @Override
     public void onUpdate(UpdateEvent event) {
-        var player = mc.player;
+        LocalPlayer player = mc.player;
         if (player == null) return;
 
-        // Cancel movement keys if the option is enabled
         if (cancelPlayerMovement.get()) {
-            KeyMapping.setAll();
-            player.setDeltaMovement(0, 0, 0);
+            player.setDeltaMovement(Vec3.ZERO);
             return;
         }
 
-        // Increment tick counter and refresh stored motion every 15 ticks to sync with server updates
-        ticks++;
-        if (ticks >= 15) {
-            ticks = 0;
-            storedX = player.getDeltaMovement().x;
-            storedY = player.getDeltaMovement().y;
-            storedZ = player.getDeltaMovement().z;
-        }
-
-        // Determine movement components based on the stop flags
-        double nx = storedX, ny = storedY, nz = storedZ;
-        if (!stopX.get()) nx = player.getDeltaMovement().x;
-        if (!stopY.get()) ny = player.getDeltaMovement().y;
-        if (!stopZ.get()) nz = player.getDeltaMovement().z;
-
-        // Apply the computed motion and keep position steady
-        player.setDeltaMovement(nx, ny, nz);
+        Vec3 currentMovement = player.getDeltaMovement();
+        refreshStoredMovement(currentMovement);
+        player.setDeltaMovement(applyAxisLocks(currentMovement));
     }
 
     @Override
     public void onSendPacket(SendPacketEvent event) {
-        var player = mc.player;
-        if (cancelPlayerMovement.get() && event.packet instanceof ServerboundMovePlayerPacket && player != null) {
-            // Zero vertical motion to prevent falling
-            var mv = player.getDeltaMovement();
-            player.setDeltaMovement(mv.x, 0.0, mv.z);
-            BlinkUtil.INSTANCE.setLimiter(true); // stop sending movement packets
-            event.cancel();
+        if (mc.level == null) return;
+
+        if (cancelPlayerMovement.get() && event.packet instanceof ServerboundMovePlayerPacket) {
+            cancelMovementPacket(event);
             return;
         }
-        // If cancellation is active, block all move packets
-        if (cancelPlayerMovement.get()) {
-            if (event.packet instanceof ServerboundMovePlayerPacket) {
-                event.cancel();
-                return;
-            }
-        }
-        // Otherwise maintain tick-based cancellation logic
-        if (ticks != 0) {
+
+        if (ticksSinceMotionRefresh != 0) {
             event.cancel();
         }
+    }
+
+    private void refreshStoredMovement(Vec3 currentMovement) {
+        ticksSinceMotionRefresh++;
+        if (ticksSinceMotionRefresh < 15) return;
+
+        ticksSinceMotionRefresh = 0;
+        storedMovement = currentMovement;
+    }
+
+    private Vec3 applyAxisLocks(Vec3 currentMovement) {
+        return new Vec3(
+                stopX.get() ? storedMovement.x : currentMovement.x,
+                stopY.get() ? storedMovement.y : currentMovement.y,
+                stopZ.get() ? storedMovement.z : currentMovement.z
+        );
+    }
+
+    private void cancelMovementPacket(SendPacketEvent event) {
+        LocalPlayer player = mc.player;
+        if (player != null) {
+            Vec3 movement = player.getDeltaMovement();
+            player.setDeltaMovement(movement.x, 0.0, movement.z);
+            BlinkUtil.INSTANCE.setLimiter(true);
+        }
+
+        event.cancel();
+    }
+
+    private void resetMotionState() {
+        ticksSinceMotionRefresh = 0;
+        storedMovement = Vec3.ZERO;
     }
 }
