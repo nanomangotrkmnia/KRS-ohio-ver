@@ -78,22 +78,22 @@ public final class GraphicsApiCompatibility {
     private static final int TRANSFER_COPYING = 1;
     private static final int TRANSFER_READY = 2;
     private static final int TRANSFER_GPU_IN_FLIGHT = 3;
+    private static final int FALLBACK_REFRESH_RATE = 120;
+    private static final long REFRESH_RATE_CACHE_NANOS = 1_000_000_000L;
 
     public enum Layer {
-        NANO_VG(true, 60),
-        NANO_VG_BEFORE_GUI(true, 60),
-        NANO_VG_IMMEDIATE(true, 60),
-        ESP(true, 60),
-        IMGUI(false, 60);
+        NANO_VG(true, -1),
+        NANO_VG_BEFORE_GUI(true, -1),
+        NANO_VG_IMMEDIATE(true, -1),
+        ESP(true, 0),
+        IMGUI(false, -1);
 
         private final boolean scaled;
-        private final long updateIntervalNanos;
+        private final int maximumFramesPerSecond;
 
         Layer(boolean scaled, int maximumFramesPerSecond) {
             this.scaled = scaled;
-            this.updateIntervalNanos = maximumFramesPerSecond <= 0
-                    ? 0L
-                    : 1_000_000_000L / maximumFramesPerSecond;
+            this.maximumFramesPerSecond = maximumFramesPerSecond;
         }
     }
 
@@ -119,6 +119,8 @@ public final class GraphicsApiCompatibility {
     private static final Map<Layer, LayerCache> LAYER_CACHES = new EnumMap<>(Layer.class);
     private static ExecutorService transferExecutor;
     private static long lastTransferFailureLogNanos;
+    private static long refreshRateCacheExpiresNanos;
+    private static int cachedRefreshRate = FALLBACK_REFRESH_RATE;
 
     private GraphicsApiCompatibility() {
     }
@@ -131,7 +133,7 @@ public final class GraphicsApiCompatibility {
         compatibilityRenderer = !(device.backend instanceof GlDevice);
         if (compatibilityRenderer) {
             createOffscreenContext();
-            transferExecutor = Executors.newSingleThreadExecutor(task -> {
+            transferExecutor = Executors.newFixedThreadPool(2, task -> {
                 Thread thread = new Thread(task, "Krs compatibility transfer");
                 thread.setDaemon(true);
                 return thread;
@@ -200,9 +202,11 @@ public final class GraphicsApiCompatibility {
     }
 
     /**
-     * Renders a cached compatibility layer. NanoVG-oriented layers are updated
-     * at most 60 times per second and at a maximum device-pixel ratio of two.
-     * Frames between updates reuse the already uploaded Vulkan texture.
+     * Renders a cached compatibility layer. UI layers follow the active
+     * display refresh rate at a maximum device-pixel ratio of two. ESP requests
+     * every game frame so camera transforms cannot outpace its cached image.
+     * The asynchronous transfer queue applies backpressure when either GPU is
+     * unable to keep up.
      *
      * @param skipped invoked instead of {@code renderer} when a cached frame is
      *                reused; queue-backed renderers use this to drop stale work
@@ -246,9 +250,10 @@ public final class GraphicsApiCompatibility {
         reclaimGpuTransfers(cache);
         uploadNewestReadyTransfer(cache);
 
-        boolean update = cache.lastRenderNanos == 0L
-                || layer.updateIntervalNanos == 0L
-                || now - cache.lastRenderNanos >= layer.updateIntervalNanos;
+        long updateIntervalNanos = getUpdateIntervalNanos(layer, now);
+        boolean update = updateIntervalNanos == 0L
+                || cache.nextRenderNanos == 0L
+                || now >= cache.nextRenderNanos;
 
         OpenGlFramebuffer glFramebuffer = layer.scaled ? SCALED_FRAMEBUFFER : NATIVE_FRAMEBUFFER;
         boolean rendered = false;
@@ -259,13 +264,58 @@ public final class GraphicsApiCompatibility {
             ));
             rendered = issued[0];
             if (rendered)
-                cache.lastRenderNanos = now;
+                scheduleNextRender(cache, now, updateIntervalNanos);
         }
 
         if (!rendered && skipped != null)
             skipped.run();
 
         compositeCachedLayer(target, cache, width, height);
+    }
+
+    private static long getUpdateIntervalNanos(Layer layer, long now) {
+        int maximumFramesPerSecond = layer.maximumFramesPerSecond;
+        if (maximumFramesPerSecond == 0)
+            return 0L;
+        if (maximumFramesPerSecond < 0)
+            maximumFramesPerSecond = getDisplayRefreshRate(now);
+        return 1_000_000_000L / Math.max(1, maximumFramesPerSecond);
+    }
+
+    private static int getDisplayRefreshRate(long now) {
+        if (now < refreshRateCacheExpiresNanos)
+            return cachedRefreshRate;
+
+        int refreshRate = 0;
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft != null && minecraft.getWindow() != null)
+            refreshRate = minecraft.getWindow().getRefreshRate();
+        if (refreshRate < 30) {
+            int frameLimit = minecraft == null ? 0 : minecraft.options.framerateLimit().get();
+            refreshRate = frameLimit >= 30 ? frameLimit : FALLBACK_REFRESH_RATE;
+        }
+
+        cachedRefreshRate = refreshRate;
+        refreshRateCacheExpiresNanos = now + REFRESH_RATE_CACHE_NANOS;
+        return refreshRate;
+    }
+
+    private static void scheduleNextRender(LayerCache cache, long now, long intervalNanos) {
+        if (intervalNanos == 0L) {
+            cache.nextRenderNanos = 0L;
+            return;
+        }
+
+        long next = cache.nextRenderNanos;
+        if (next == 0L || now - next > intervalNanos * 4L) {
+            cache.nextRenderNanos = now + intervalNanos;
+            return;
+        }
+
+        do {
+            next += intervalNanos;
+        } while (next <= now);
+        cache.nextRenderNanos = next;
     }
 
     private static int[] getRenderSize(Layer layer, int targetWidth, int targetHeight) {
@@ -599,7 +649,7 @@ public final class GraphicsApiCompatibility {
         cache.byteCount = Math.multiplyExact(Math.multiplyExact(width, height), 4);
         cache.generation++;
         cache.nextSequence = 0L;
-        cache.lastRenderNanos = 0L;
+        cache.nextRenderNanos = 0L;
         cache.activeTextureIndex = -1;
 
         ensureTransferResources(cache);
@@ -608,7 +658,7 @@ public final class GraphicsApiCompatibility {
 
     private static void invalidateLayerCache(LayerCache cache) {
         cache.generation++;
-        cache.lastRenderNanos = 0L;
+        cache.nextRenderNanos = 0L;
         cache.activeTextureIndex = -1;
     }
 
@@ -776,6 +826,8 @@ public final class GraphicsApiCompatibility {
         offscreenWindow = 0L;
         offscreenCapabilities = null;
         transferExecutor = null;
+        refreshRateCacheExpiresNanos = 0L;
+        cachedRefreshRate = FALLBACK_REFRESH_RATE;
         compatibilityRenderer = false;
         layerActive = false;
         activeLayerWidth = 0;
@@ -896,7 +948,7 @@ public final class GraphicsApiCompatibility {
         private int activeTextureIndex = -1;
         private long generation;
         private long nextSequence;
-        private long lastRenderNanos;
+        private long nextRenderNanos;
         private long lastInvocationNanos;
 
         private LayerCache() {
