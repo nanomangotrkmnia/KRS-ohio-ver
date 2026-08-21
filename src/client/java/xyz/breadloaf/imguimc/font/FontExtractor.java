@@ -16,7 +16,8 @@ public class FontExtractor {
         }
         return new File(fontDir, fontNameTtf).getAbsolutePath();
     }
-    public static void extractFont() throws IOException {
+
+    public static void extractFont() throws Exception {
         if (fontDir == null) {
             fontDir = new File(System.getProperty("java.io.tmpdir"), "krs_imguimc_fonts");
         }

@@ -95,7 +95,7 @@ public class ModuleManager implements EventListener {
                 new Spider(), new AutoRocket(), new AutoTotem(), new ItemDropChanger(),
                 new XCarry(), new PortalGodMode(), new Stasis(), new TPStealer(), new TPSurround(),
                 new BedESP(), new NoBreakReset(), new TrueSight(), new AutoTool(), new DurabilityAlert(),
-                new Freelook()
+                new Freelook(), new HUDHider()
         ));
 
         devModules.addAll(List.of(
