@@ -72,9 +72,9 @@ public class ModuleManager implements EventListener {
                 new SpinBot(), new BrandSpoofer(), new AntiBot(), new AutoPot(), new Criticals(),
                 new Teams(), new Velocity(), new Phase(), new ServerCrasher(), new Spammer(),
                 new PerfectHorseJump(), new InventoryMove(), new Jesus(), new NoSlow(), new LongJump(),
-                new ChestStealer(), new FastLadder(), new InvManager(), new NoFall(),
+                new ChestStealer(), new FastLadder(), new InvManager(), new NoFall(), new AirPlace(),
                 new Sprint(), new ThunderDetector(), new KillEffect(), new CameraNoClip(),
-                new AntiBlind(), new Breaker(), new CivBreak(), new Timer(), new Nuker(),
+                new AntiBlind(), new Breaker(), new CivBreak(), new Timer(), new Nuker(), new NoteBot(),
                 new Xray(), new CaveFinder(), new Scaffold(), new Blink(), new TransactionConfirmBlinker(), new ExploitPatcher(),
                 new PortalScreen(), new FullBright(), new TargetStrafe(), new DisablerModule(),
                 new OldHitting(), new Freecam(), new ClientCape(), new EntityYawFix(), new MurdererDetector(),
@@ -99,7 +99,7 @@ public class ModuleManager implements EventListener {
         ));
 
         devModules.addAll(List.of(
-                new BlockBreakSimulator2(), new Debugga(), new NoteBot(), new NoMoreAutism(), new ChatExcepChecker(),
+                new BlockBreakSimulator2(), new Debugga(), new NoMoreAutism(), new ChatExcepChecker(),
                 new FukumaiPlayerTracker(), new MovementUtilTest(), new TuckMod(), new Sex()
         ));
 
@@ -292,7 +292,7 @@ public class ModuleManager implements EventListener {
     public void onReceivedPacket(ReceivedPacketEvent event) {
         if (mc.player == null || mc.level == null) return;
 
-        if (BlinkUtil.INSTANCE.getBlinking() && Blink.shouldBlinkIncoming() && !getModuleState(Freecam.class)) {
+        if (BlinkUtil.INSTANCE.getBlinking() && Blink.shouldQueueIncoming(event.packet) && !getModuleState(Freecam.class)) {
             event.cancel();
             BlinkUtil.INSTANCE.addIncomingPacket(event.packet);
         }
