@@ -1,6 +1,7 @@
 package com.instrumentalist.krs.hacks.features.dev;
 
 import com.instrumentalist.krs.events.features.AttackEvent;
+import com.instrumentalist.krs.events.features.UpdateEvent;
 import com.instrumentalist.krs.hacks.Module;
 import com.instrumentalist.krs.hacks.ModuleCategory;
 import com.instrumentalist.krs.utils.ChatUtil;
