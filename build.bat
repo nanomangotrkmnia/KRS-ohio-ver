@@ -66,7 +66,7 @@ echo Building with gradlew.bat ...
 echo.
 set "JAVA_HOME=!JAVA_HOME_FOUND!"
 set "PATH=!JAVA_HOME_FOUND!\bin;!PATH!"
-call gradlew.bat build
+call .\gradlew.bat build
 set "BUILD_EXIT=%errorlevel%"
 echo.
 echo Build finished with exit code %BUILD_EXIT%.
