@@ -87,6 +87,21 @@ dependencies {
     runtimeOnly 'org.lwjgl:lwjgl-stb::natives-linux'
     runtimeOnly 'org.lwjgl:lwjgl-stb::natives-macos'
     runtimeOnly 'org.lwjgl:lwjgl-stb::natives-macos-arm64'
+    library("org.lwjgl:lwjgl-stb:${lwjglVersion}") {
+        transitive = false
+    }
+    library("org.lwjgl:lwjgl-stb:${lwjglVersion}:natives-windows") {
+        transitive = false
+    }
+    library("org.lwjgl:lwjgl-stb:${lwjglVersion}:natives-linux") {
+        transitive = false
+    }
+    library("org.lwjgl:lwjgl-stb:${lwjglVersion}:natives-macos") {
+        transitive = false
+    }
+    library("org.lwjgl:lwjgl-stb:${lwjglVersion}:natives-macos-arm64") {
+        transitive = false
+    }
 }
 
 tasks.withType(ProcessResources).configureEach {

@@ -54,7 +54,7 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
     private final MenuButton realmsButton = new MenuButton("Realms");
     private final MenuButton friendsButton = new MenuButton("Friends");
     private final MenuButton optionsButton = new MenuButton("Options");
-    private final MenuButton updateAvailableButton = new MenuButton("Update Available");
+    private final MenuButton updateAvailableButton = new MenuButton("Update Here");
     private final MenuButton exitButton = new MenuButton("Exit");
     private final List<MenuButton> menuButtons = List.of(
             singlePlayerButton,
@@ -143,11 +143,11 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
         vg.roundedRectangle(state.x - 110f, state.y - 34f, 220f, 38f, 14f, baseColor);
 
         if (state.animation > 1f) {
-            vg.roundedRectangle(state.x - state.animation, state.y - 2.5f, state.animation * 2f, 3f, 2f, NanoVGTheme.accent(state.hovered ? 230 : 170));
+            vg.roundedRectangle(state.x - state.animation, state.y - 2.5f, state.animation * 2f, 3f, 2f, new Color(255, 255, 255, state.hovered ? 230 : 170));
         }
 
         NVGFont font = state.fontSize > 22f ? NVGFonts.INTER_MEDIUM : NVGFonts.INTER;
-        font.drawText(state.label, state.x, state.y - 15f - (state.fontSize - 21f), state.fontSize, state.hovered ? NanoVGTheme.ACCENT : Color.WHITE, Alignment.CENTER_MIDDLE, true);
+        font.drawText(state.label, state.x, state.y - 15f - (state.fontSize - 21f), state.fontSize, Color.WHITE, Alignment.CENTER_MIDDLE, true);
     }
 
     private void renderMusicVolumeSlider(NVGU vg, float centerX, float mouseX, float mouseY) {
@@ -332,7 +332,7 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
         float markerX = trackX - markerWidth + (trackWidth + markerWidth * 2f) * phase;
 
         vg.scissor(trackX, trackY, trackWidth, trackHeight, () ->
-                vg.roundedRectangle(markerX, trackY, markerWidth, trackHeight, 3f, NanoVGTheme.ACCENT)
+                vg.roundedRectangle(markerX, trackY, markerWidth, trackHeight, 3f, new Color(255, 255, 255, 230))
         );
     }
 
@@ -473,7 +473,7 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
                             mc.gui.setScreen(new OptionsScreen(this, mc.options, false));
                             return true;
 
-                        case "Update Available":
+                        case "Update Here":
                             FileUtil.INSTANCE.openInBrowser(RELEASES_URL);
                             return true;
 

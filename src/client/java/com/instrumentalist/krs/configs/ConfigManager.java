@@ -2,6 +2,7 @@ package com.instrumentalist.krs.configs;
 
 import com.instrumentalist.krs.utils.IMinecraft;
 import com.google.gson.Gson;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.instrumentalist.krs.Client;
 import com.instrumentalist.krs.hacks.ModuleManager;
@@ -17,23 +18,33 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class ConfigManager implements IMinecraft {
 
     private final Gson gson = new Gson();
     private static final String ONLINE_CONFIG_SUFFIX = "-online";
+    private static final String UPDATED_AT_KEY = "_updated";
     private static final float DEFAULT_MAIN_MENU_MUSIC_VOLUME = 0f;
     private static final long MAX_LOCAL_CONFIG_BYTES = 4L * 1024L * 1024L;
-    private static final int MAX_CONFIG_NAME_LENGTH = 96;
+    public static final int MAX_CONFIG_NAME_LENGTH = 96;
     public final File BASE_DIR = new File(mc.gameDirectory, Client.configLocation);
     private final File CLIENT_FILE = new File(BASE_DIR, "client.json");
     public String configCurrent = "default", bindCurrent = "default";
     private float mainMenuMusicVolume = DEFAULT_MAIN_MENU_MUSIC_VOLUME;
     private int mainMenuMusicFrame;
     private final AtomicLong onlineConfigRequestGeneration = new AtomicLong();
+    private final Map<String, Long> moduleUpdatedCache = new HashMap<>();
+    private final Map<String, Long> bindUpdatedCache = new HashMap<>();
 
     public void saveConfigFile(String configName, Boolean saveToDefaultFile) {
+        saveConfigFile(configName, saveToDefaultFile, null);
+    }
+
+    public void saveConfigFile(String configName, Boolean saveToDefaultFile, Long incomingUpdated) {
         configName = normalizeConfigName(configName);
 
         this.configCurrent = configName;
@@ -50,7 +61,7 @@ public class ConfigManager implements IMinecraft {
         File base = new File(BASE_DIR, "module_configs");
         File dir = new File(base, this.configCurrent + ".json");
 
-        writeJson(dir, configObject, "module config");
+        writeJson(dir, withUpdatedTimestamp(configObject, dir, false, this.configCurrent, incomingUpdated), "module config");
     }
 
     public void saveBindFile(String bindName, Boolean saveToDefaultFile) {
@@ -70,7 +81,7 @@ public class ConfigManager implements IMinecraft {
         File base = new File(BASE_DIR, "bind_configs");
         File bindFile = new File(base, this.bindCurrent + ".json");
 
-        writeJson(bindFile, bindObject, "bind config");
+        writeJson(bindFile, withUpdatedTimestamp(bindObject, bindFile, true, this.bindCurrent, null), "bind config");
     }
 
     public void loadConfig(String configName, boolean online) {
@@ -89,7 +100,7 @@ public class ConfigManager implements IMinecraft {
                     if (configObject == null) return;
 
                     loadModuleConfigObject(configObject);
-                    saveConfigFile(onlineConfigClientName(onlineConfigName), true);
+                    saveConfigFile(onlineConfigClientName(onlineConfigName), true, readUpdatedMillis(configObject));
                     Interface.reloadSortedModules();
                 } catch (Exception e) {
                     System.err.println("Failed to load online module config: " + e.getMessage());
@@ -142,7 +153,7 @@ public class ConfigManager implements IMinecraft {
             final JsonObject bindData = readJsonObject(bindFile);
             if (bindData == null) return;
             bindData.entrySet().forEach(entry -> {
-                if (!entry.getValue().isJsonObject()) return;
+                if (isConfigMetadataKey(entry.getKey()) || !entry.getValue().isJsonObject()) return;
 
                 final String moduleName = entry.getKey();
                 final JsonObject moduleData = entry.getValue().getAsJsonObject();
@@ -342,9 +353,114 @@ public class ConfigManager implements IMinecraft {
         return value.length() >= suffix.length() && value.regionMatches(true, value.length() - suffix.length(), suffix, 0, suffix.length());
     }
 
+    public Long configUpdatedAt(boolean bind, String configName) {
+        String cacheKey = updatedCacheKey(configName);
+        if (cacheKey == null)
+            return null;
+
+        Map<String, Long> cache = bind ? bindUpdatedCache : moduleUpdatedCache;
+        Long cached = cache.get(cacheKey);
+        if (cached != null)
+            return cached;
+
+        File file = configFile(bind, configName);
+        if (file == null || !file.isFile())
+            return null;
+
+        Long updated = readUpdatedAt(file);
+        if (updated != null)
+            cache.put(cacheKey, updated);
+        return updated;
+    }
+
+    public void forgetConfigUpdated(boolean bind, String configName) {
+        String cacheKey = updatedCacheKey(configName);
+        if (cacheKey == null)
+            return;
+
+        (bind ? bindUpdatedCache : moduleUpdatedCache).remove(cacheKey);
+    }
+
+    public String renameConfig(boolean bind, String oldName, String newName) {
+        String from = normalizeConfigName(oldName);
+        String to = normalizeConfigName(newName);
+        if (from.isBlank() || to.isBlank())
+            return null;
+        if (from.equals(to))
+            return from;
+
+        File fromFile = configFile(bind, from);
+        File toFile = configFile(bind, to);
+        if (fromFile == null || toFile == null || !fromFile.isFile())
+            return null;
+
+        boolean caseOnly = from.equalsIgnoreCase(to);
+        if (!caseOnly && toFile.isFile())
+            return null;
+
+        Path source = fromFile.toPath();
+        Path target = toFile.toPath();
+        Path temp = null;
+        try {
+            if (caseOnly) {
+                temp = source.resolveSibling("." + fromFile.getName() + "." + System.nanoTime() + ".rename");
+                moveConfigFile(source, temp, false);
+                moveConfigFile(temp, target, false);
+                temp = null;
+            } else {
+                moveConfigFile(source, target, false);
+            }
+        } catch (IOException e) {
+            System.err.println("Failed to rename config: " + e.getMessage());
+            if (temp != null) {
+                try {
+                    moveConfigFile(temp, source, true);
+                } catch (IOException ignored) {
+                }
+            }
+            return null;
+        }
+
+        Long updated = (bind ? bindUpdatedCache : moduleUpdatedCache).remove(updatedCacheKey(from));
+        if (updated != null)
+            rememberUpdated(bind, to, updated);
+        else {
+            Long stored = readUpdatedAt(toFile);
+            if (stored != null)
+                rememberUpdated(bind, to, stored);
+        }
+
+        if (bind) {
+            if (from.equalsIgnoreCase(this.bindCurrent)) {
+                this.bindCurrent = to;
+                saveClientJS();
+            }
+        } else if (from.equalsIgnoreCase(this.configCurrent)) {
+            this.configCurrent = to;
+            saveClientJS();
+        }
+
+        FileUtil.INSTANCE.invalidateLocalConfigCache();
+        return to;
+    }
+
+    private static void moveConfigFile(Path source, Path target, boolean replace) throws IOException {
+        try {
+            if (replace)
+                Files.move(source, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            else
+                Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            if (replace)
+                Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+            else
+                Files.move(source, target);
+        }
+    }
+
     private void loadModuleConfigObject(JsonObject configObject) {
         configObject.entrySet().forEach(entry -> {
-            if (!entry.getValue().isJsonObject()) return;
+            if (isConfigMetadataKey(entry.getKey()) || !entry.getValue().isJsonObject()) return;
 
             com.instrumentalist.krs.hacks.Module module = ModuleManager.getModuleByName(entry.getKey());
             if (module != null && module.configObject != null)
@@ -389,6 +505,91 @@ public class ConfigManager implements IMinecraft {
 
     private int clampMainMenuMusicFrame(int frame) {
         return Math.max(0, frame);
+    }
+
+    private JsonObject withUpdatedTimestamp(JsonObject payload, File file, boolean bind, String configName, Long incomingUpdated) {
+        long updated = incomingUpdated != null && incomingUpdated > 0L
+                ? incomingUpdated
+                : System.currentTimeMillis();
+        if (file.isFile()) {
+            try {
+                JsonObject existing = readJsonObject(file);
+                if (existing != null) {
+                    Long previous = readUpdatedMillis(existing);
+                    existing.remove(UPDATED_AT_KEY);
+                    if (existing.equals(payload)) {
+                        if (previous != null && previous > 0L)
+                            updated = previous;
+                        else {
+                            long lastModified = file.lastModified();
+                            updated = lastModified > 0L ? lastModified : updated;
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        rememberUpdated(bind, configName, updated);
+
+        JsonObject output = new JsonObject();
+        output.addProperty(UPDATED_AT_KEY, updated);
+        payload.entrySet().forEach(entry -> output.add(entry.getKey(), entry.getValue()));
+        return output;
+    }
+
+    private Long readUpdatedAt(File file) {
+        try {
+            JsonObject existing = readJsonObject(file);
+            Long stored = readUpdatedMillis(existing);
+            if (stored != null && stored > 0L)
+                return stored;
+        } catch (Exception ignored) {
+        }
+
+        long lastModified = file.lastModified();
+        return lastModified > 0L ? lastModified : null;
+    }
+
+    private void rememberUpdated(boolean bind, String configName, long updated) {
+        String cacheKey = updatedCacheKey(configName);
+        if (cacheKey == null)
+            return;
+
+        (bind ? bindUpdatedCache : moduleUpdatedCache).put(cacheKey, updated);
+    }
+
+    private File configFile(boolean bind, String configName) {
+        String normalized = normalizeConfigName(configName);
+        if (normalized.isBlank())
+            return null;
+
+        return new File(new File(BASE_DIR, bind ? "bind_configs" : "module_configs"), normalized + ".json");
+    }
+
+    private static String updatedCacheKey(String configName) {
+        String normalized = normalizeConfigName(configName);
+        return normalized.isBlank() ? null : normalized.toLowerCase(Locale.ROOT);
+    }
+
+    private static Long readUpdatedMillis(JsonObject object) {
+        if (object == null || !object.has(UPDATED_AT_KEY) || object.get(UPDATED_AT_KEY).isJsonNull())
+            return null;
+
+        JsonElement element = object.get(UPDATED_AT_KEY);
+        if (element == null || !element.isJsonPrimitive() || !element.getAsJsonPrimitive().isNumber())
+            return null;
+
+        try {
+            long updated = element.getAsLong();
+            return updated > 0L ? updated : null;
+        } catch (RuntimeException ignored) {
+            return null;
+        }
+    }
+
+    private static boolean isConfigMetadataKey(String key) {
+        return UPDATED_AT_KEY.equals(key);
     }
 
     private void writeJson(File file, JsonObject jsonObject, String label) {
