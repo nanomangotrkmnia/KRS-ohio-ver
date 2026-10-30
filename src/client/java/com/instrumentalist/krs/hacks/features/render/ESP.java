@@ -7,6 +7,7 @@ import com.instrumentalist.krs.hacks.ModuleManager;
 import com.instrumentalist.krs.hacks.features.player.Freecam;
 import com.instrumentalist.krs.utils.render.GuiEntityRenderGuard;
 import com.instrumentalist.krs.utils.render.GraphicsApiCompatibility;
+import com.instrumentalist.krs.utils.render.IrisCompat;
 import com.instrumentalist.krs.utils.render.Shader2DRenderer;
 import com.instrumentalist.krs.utils.value.BooleanValue;
 import com.instrumentalist.mixin.oringo.IEntityRenderState;
@@ -51,13 +52,11 @@ import java.io.InputStream;
 import java.nio.FloatBuffer;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.WeakHashMap;
 
 public class ESP extends Module {
@@ -71,10 +70,11 @@ public class ESP extends Module {
     private static final SilhouetteVertexConsumer SILHOUETTE_CONSUMER = new SilhouetteVertexConsumer();
     private static final Map<NativeImage, AlphaMask> IMAGE_ALPHA_MASKS = new WeakHashMap<>();
     private static final Map<TextureAtlasSprite, AlphaMask> SPRITE_ALPHA_MASKS = new WeakHashMap<>();
-    private static final Map<Identifier, AlphaMask> TEXTURE_ALPHA_MASKS = new HashMap<>();
+    private static final Map<Identifier, TextureAlphaMask> TEXTURE_ALPHA_MASKS = new HashMap<>();
     private static final Map<RenderType, ArmorRenderKind> ARMOR_RENDER_TYPES = new IdentityHashMap<>();
     private static final Map<RenderType, Identifier> RENDER_TYPE_TEXTURES = new IdentityHashMap<>();
-    private static final Set<Identifier> UNMASKED_TEXTURES = new HashSet<>();
+    private static final int CELL_PATTERN_CACHE_LIMIT = 8192;
+    private static final Map<CellPatternKey, int[]> CELL_PATTERNS = new HashMap<>();
     private static int captureWidth = 0;
     private static int captureHeight = 0;
     private static int captureId = 0;
@@ -87,6 +87,8 @@ public class ESP extends Module {
     private static Object itemCaptureState = null;
     private static Object equipmentCaptureState = null;
     private static boolean itemCaptureArmor = false;
+    private static final Matrix4f IRIS_PROJECTION = new Matrix4f();
+    private static boolean irisProjectionSynced = false;
 
     public ESP() {
         super("ESP", ModuleCategory.Render, Keys.KEY_UNKNOWN, false, true);
@@ -127,6 +129,7 @@ public class ESP extends Module {
         captureOpen = true;
         reversedDepth = false;
         zeroToOneDepth = false;
+        irisProjectionSynced = false;
 
         updateProjection();
     }
@@ -142,6 +145,7 @@ public class ESP extends Module {
 
         if (!projectionReady && !updateProjection())
             return;
+        syncIrisProjection();
 
         Entity entity = getCapturedEntity(captureModelState ? modelSubmit.state() : equipmentCaptureState);
         Model<? super S> model = modelSubmit.model();
@@ -195,6 +199,7 @@ public class ESP extends Module {
 
         if (!projectionReady && !updateProjection())
             return;
+        syncIrisProjection();
 
         VertexConsumer consumer = SILHOUETTE_CONSUMER.reset(
                 VIEW_PROJECTION,
@@ -243,6 +248,7 @@ public class ESP extends Module {
 
         if (!projectionReady && !updateProjection())
             return;
+        syncIrisProjection();
 
         SilhouetteVertexConsumer consumer = SILHOUETTE_CONSUMER.reset(
                 VIEW_PROJECTION,
@@ -255,6 +261,26 @@ public class ESP extends Module {
         for (BakedQuad quad : quads) {
             consumer.addBakedQuad(poseMatrix, quad, alphaMaskFor(quad));
         }
+    }
+
+    public static void captureCustomModel(Object state, PoseStack.Pose pose, Identifier texture, float[] positions, float[] uvs, int[] indices) {
+        if (!canCapture() || pose == null || !shouldCaptureState(state))
+            return;
+
+        if (!projectionReady && !updateProjection())
+            return;
+        syncIrisProjection();
+
+        SilhouetteVertexConsumer consumer = SILHOUETTE_CONSUMER.reset(
+                VIEW_PROJECTION,
+                captureWidth,
+                captureHeight,
+                alphaMaskFor(texture),
+                TRIANGLES
+        );
+        Matrix4fc poseMatrix = pose.pose();
+        for (int i = 0; i + 2 < indices.length; i += 3)
+            consumer.addMeshTriangle(poseMatrix, positions, uvs, indices[i], indices[i + 1], indices[i + 2]);
     }
 
     public static void renderCapturedShadow() {
@@ -348,7 +374,17 @@ public class ESP extends Module {
     }
 
     private static boolean canCapture() {
-        return captureOpen && !GuiEntityRenderGuard.isActive();
+        return captureOpen && !GuiEntityRenderGuard.isActive() && !IrisCompat.isRenderingShadowPass();
+    }
+
+    private static void syncIrisProjection() {
+        if (irisProjectionSynced)
+            return;
+        irisProjectionSynced = true;
+        if (!IrisCompat.isShaderPackInUse() || !IrisCompat.gbufferMatrices(IRIS_PROJECTION, VIEW_PROJECTION))
+            return;
+
+        reversedDepth = isReversedDepthProjection(IRIS_PROJECTION);
     }
 
     private static boolean updateProjection() {
@@ -374,7 +410,7 @@ public class ESP extends Module {
         TEXTURE_ALPHA_MASKS.clear();
         ARMOR_RENDER_TYPES.clear();
         RENDER_TYPE_TEXTURES.clear();
-        UNMASKED_TEXTURES.clear();
+        CELL_PATTERNS.clear();
         captureOpen = false;
         projectionReady = false;
         reversedDepth = false;
@@ -382,6 +418,7 @@ public class ESP extends Module {
         itemCaptureState = null;
         equipmentCaptureState = null;
         itemCaptureArmor = false;
+        irisProjectionSynced = false;
         captureWidth = 0;
         captureHeight = 0;
         captureId++;
@@ -392,15 +429,7 @@ public class ESP extends Module {
         if (!(model instanceof PlayerModel) || !(entity instanceof AbstractClientPlayer player))
             return null;
 
-        AbstractTexture texture = mc.getTextureManager().getTexture(player.getSkin().body().texturePath());
-        if (!(texture instanceof DynamicTexture dynamicTexture))
-            return null;
-
-        NativeImage image = dynamicTexture.getPixels();
-        if (image.isClosed() || image.getWidth() <= 0 || image.getHeight() <= 0)
-            return null;
-
-        return IMAGE_ALPHA_MASKS.computeIfAbsent(image, NativeImageAlphaMask::new);
+        return alphaMaskForTexture(player.getSkin().body().texturePath());
     }
 
     private static ArmorRenderKind armorRenderKind(RenderType renderType) {
@@ -411,21 +440,36 @@ public class ESP extends Module {
     }
 
     private static ArmorRenderKind detectArmorRenderKind(RenderType renderType) {
-        String name = renderType.toString().toLowerCase(Locale.ROOT);
-        if (name.contains("armor_entity_glint")
-                || name.contains("armor_trims")
-                || name.contains("textures/atlas/armor_trims")) {
+        String description = renderType.toString().toLowerCase(Locale.ROOT);
+        String name = renderTypeName(description);
+        if (name.startsWith("armor_trim")
+                || name.equals("trimmed_armor_glint")
+                || name.equals("armor_entity_glint")) {
             return ArmorRenderKind.OVERLAY;
         }
 
-        if (name.contains("armor_cutout_no_cull")
-                || name.contains("armor_decal_cutout_no_cull")
-                || name.contains("armor_translucent")
-                || name.contains("textures/models/armor")) {
+        if (name.startsWith("armor_cutout_no_cull")
+                || name.startsWith("armor_decal_cutout_no_cull")
+                || name.startsWith("armor_translucent")
+                || description.contains("textures/models/armor")
+                || description.contains("textures/entity/equipment/humanoid")) {
             return ArmorRenderKind.ARMOR;
         }
 
         return ArmorRenderKind.NONE;
+    }
+
+    private static String renderTypeName(String description) {
+        String prefix = "rendertype[";
+        if (!description.startsWith(prefix))
+            return description;
+
+        int end = description.indexOf(':', prefix.length());
+        return end < 0 ? description.substring(prefix.length()) : description.substring(prefix.length(), end);
+    }
+
+    private static AlphaMask alphaMaskFor(Identifier texture) {
+        return alphaMaskForTexture(texture);
     }
 
     private static AlphaMask alphaMaskFor(BakedQuad quad) {
@@ -443,22 +487,39 @@ public class ESP extends Module {
     }
 
     private static AlphaMask alphaMaskFor(RenderType renderType) {
-        Identifier texture = textureIdentifierFor(renderType);
-        if (texture == null || UNMASKED_TEXTURES.contains(texture))
+        return alphaMaskForTexture(textureIdentifierFor(renderType));
+    }
+
+    private static AlphaMask alphaMaskForTexture(Identifier texture) {
+        if (texture == null)
             return null;
 
-        AlphaMask cached = TEXTURE_ALPHA_MASKS.get(texture);
-        if (cached != null)
-            return cached;
+        AbstractTexture boundTexture = mc.getTextureManager().getTexture(texture);
+        if (boundTexture instanceof DynamicTexture dynamicTexture) {
+            NativeImage image = dynamicTexture.getPixels();
+            if (image == null || image.isClosed() || image.getWidth() <= 0 || image.getHeight() <= 0)
+                return null;
 
-        AlphaMask loaded = loadTextureAlphaMask(texture);
-        if (loaded == null) {
-            UNMASKED_TEXTURES.add(texture);
+            return IMAGE_ALPHA_MASKS.computeIfAbsent(image, NativeImageAlphaMask::new);
+        }
+
+        Object gpuTexture;
+        try {
+            gpuTexture = boundTexture.getTexture();
+        } catch (IllegalStateException exception) {
             return null;
         }
 
-        TEXTURE_ALPHA_MASKS.put(texture, loaded);
+        TextureAlphaMask cached = TEXTURE_ALPHA_MASKS.get(texture);
+        if (cached != null && cached.gpuTexture() == gpuTexture)
+            return cached.mask();
+
+        AlphaMask loaded = loadTextureAlphaMask(texture);
+        TEXTURE_ALPHA_MASKS.put(texture, new TextureAlphaMask(gpuTexture, loaded));
         return loaded;
+    }
+
+    private record TextureAlphaMask(Object gpuTexture, AlphaMask mask) {
     }
 
     private static Identifier textureIdentifierFor(RenderType renderType) {
@@ -478,7 +539,7 @@ public class ESP extends Module {
             int candidateStart = findTextureIdentifierStart(name, extension);
             if (candidateStart >= 0) {
                 Identifier texture = Identifier.tryParse(name.substring(candidateStart, extension + 4));
-                if (texture != null) {
+                if (texture != null && !texture.getPath().contains("glint")) {
                     RENDER_TYPE_TEXTURES.put(renderType, texture);
                     return texture;
                 }
@@ -645,6 +706,15 @@ public class ESP extends Module {
         private final boolean[] valid = new boolean[4];
         private AlphaMask activeAlphaMask;
         private int quadIndex = 0;
+        private boolean quadInside;
+        private final boolean[] opaqueCells = new boolean[16 * 16];
+        private final int[] openStart = new int[16];
+        private final int[] openEnd = new int[16];
+        private final int[] openRow = new int[16];
+        private final int[] nextOpenStart = new int[16];
+        private final int[] nextOpenEnd = new int[16];
+        private final int[] nextOpenRow = new int[16];
+        private int[] rectScratch = new int[64 * 4];
 
         private SilhouetteVertexConsumer() {
         }
@@ -696,6 +766,18 @@ public class ESP extends Module {
             activeAlphaMask = fallbackAlphaMask;
         }
 
+        private void addMeshTriangle(Matrix4fc poseMatrix, float[] positions, float[] uvs, int a, int b, int c) {
+            addMeshVertex(poseMatrix, positions, uvs, a);
+            addMeshVertex(poseMatrix, positions, uvs, b);
+            addMeshVertex(poseMatrix, positions, uvs, c);
+            addMeshVertex(poseMatrix, positions, uvs, c);
+        }
+
+        private void addMeshVertex(Matrix4fc poseMatrix, float[] positions, float[] uvs, int index) {
+            poseMatrix.transformPosition(positions[index * 3], positions[index * 3 + 1], positions[index * 3 + 2], itemVector);
+            addVertex(itemVector.x, itemVector.y, itemVector.z, uvs[index * 2], uvs[index * 2 + 1]);
+        }
+
         private void projectVertex(int index, float x, float y, float z) {
             Vector4f projected = vector.set(x, y, z, 1f).mul(viewProjection);
             int offset = index * 4;
@@ -714,6 +796,7 @@ public class ESP extends Module {
                 return;
             if (outsideFrustum(quadClip))
                 return;
+            quadInside = insideFrustum(quadClip);
 
             AlphaMask alphaMask = activeAlphaMask;
             if (alphaMask != null) {
@@ -742,6 +825,39 @@ public class ESP extends Module {
                 return;
             }
 
+            int[] pattern = cellPattern(alphaMask);
+            int stepsU = pattern[0];
+            int stepsV = pattern[1];
+            boolean parallelogram = isParallelogram();
+            for (int offset = 2; offset + 3 < pattern.length; offset += 4) {
+                int x0 = pattern[offset];
+                int y0 = pattern[offset + 1];
+                int x1 = pattern[offset + 2];
+                int y1 = pattern[offset + 3];
+                if (parallelogram) {
+                    emitSubQuad(x0 / (float) stepsU, y0 / (float) stepsV, x1 / (float) stepsU, y1 / (float) stepsV);
+                    continue;
+                }
+
+                for (int y = y0; y < y1; y++) {
+                    for (int x = x0; x < x1; x++)
+                        emitSubQuad(x / (float) stepsU, y / (float) stepsV, (x + 1) / (float) stepsU, (y + 1) / (float) stepsV);
+                }
+            }
+        }
+
+        private int[] cellPattern(AlphaMask alphaMask) {
+            CellPatternKey key = new CellPatternKey(alphaMask,
+                    quadU[0], quadU[1], quadU[2], quadU[3],
+                    quadV[0], quadV[1], quadV[2], quadV[3]);
+            int[] cached = CELL_PATTERNS.get(key);
+            if (cached != null)
+                return cached;
+
+            float minU = Math.min(Math.min(quadU[0], quadU[1]), Math.min(quadU[2], quadU[3]));
+            float maxU = Math.max(Math.max(quadU[0], quadU[1]), Math.max(quadU[2], quadU[3]));
+            float minV = Math.min(Math.min(quadV[0], quadV[1]), Math.min(quadV[2], quadV[3]));
+            float maxV = Math.max(Math.max(quadV[0], quadV[1]), Math.max(quadV[2], quadV[3]));
             int stepsU = clampSteps((int) Math.ceil(Math.abs(alphaMask.localU(maxU) - alphaMask.localU(minU)) * alphaMask.width()));
             int stepsV = clampSteps((int) Math.ceil(Math.abs(alphaMask.localV(maxV) - alphaMask.localV(minV)) * alphaMask.height()));
 
@@ -753,12 +869,88 @@ public class ESP extends Module {
                     float s1 = (x + 1) / (float) stepsU;
                     float sampleU = interpolateQuad(quadU, (s0 + s1) * 0.5f, (t0 + t1) * 0.5f);
                     float sampleV = interpolateQuad(quadV, (s0 + s1) * 0.5f, (t0 + t1) * 0.5f);
-                    if (!alphaMask.isOpaque(sampleU, sampleV))
-                        continue;
-
-                    emitSubQuad(s0, t0, s1, t1);
+                    opaqueCells[y * 16 + x] = alphaMask.isOpaque(sampleU, sampleV);
                 }
             }
+
+            int rectCount = mergeOpaqueCells(stepsU, stepsV);
+            int[] pattern = new int[2 + rectCount * 4];
+            pattern[0] = stepsU;
+            pattern[1] = stepsV;
+            System.arraycopy(rectScratch, 0, pattern, 2, rectCount * 4);
+            if (CELL_PATTERNS.size() >= CELL_PATTERN_CACHE_LIMIT)
+                CELL_PATTERNS.clear();
+            CELL_PATTERNS.put(key, pattern);
+            return pattern;
+        }
+
+        private int mergeOpaqueCells(int stepsU, int stepsV) {
+            int rectCount = 0;
+            int openCount = 0;
+            for (int y = 0; y <= stepsV; y++) {
+                int nextCount = 0;
+                int x = 0;
+                while (y < stepsV && x < stepsU) {
+                    if (!opaqueCells[y * 16 + x]) {
+                        x++;
+                        continue;
+                    }
+
+                    int start = x;
+                    while (x < stepsU && opaqueCells[y * 16 + x])
+                        x++;
+
+                    int row = y;
+                    for (int i = 0; i < openCount; i++) {
+                        if (openStart[i] == start && openEnd[i] == x) {
+                            row = openRow[i];
+                            openRow[i] = -1;
+                            break;
+                        }
+                    }
+                    nextOpenStart[nextCount] = start;
+                    nextOpenEnd[nextCount] = x;
+                    nextOpenRow[nextCount] = row;
+                    nextCount++;
+                }
+
+                for (int i = 0; i < openCount; i++) {
+                    if (openRow[i] < 0)
+                        continue;
+                    rectCount = addRect(rectCount, openStart[i], openRow[i], openEnd[i], y);
+                }
+
+                System.arraycopy(nextOpenStart, 0, openStart, 0, nextCount);
+                System.arraycopy(nextOpenEnd, 0, openEnd, 0, nextCount);
+                System.arraycopy(nextOpenRow, 0, openRow, 0, nextCount);
+                openCount = nextCount;
+            }
+            return rectCount;
+        }
+
+        private int addRect(int rectCount, int x0, int y0, int x1, int y1) {
+            if ((rectCount + 1) * 4 > rectScratch.length)
+                rectScratch = Arrays.copyOf(rectScratch, rectScratch.length * 2);
+
+            int offset = rectCount * 4;
+            rectScratch[offset] = x0;
+            rectScratch[offset + 1] = y0;
+            rectScratch[offset + 2] = x1;
+            rectScratch[offset + 3] = y1;
+            return rectCount + 1;
+        }
+
+        private boolean isParallelogram() {
+            for (int component = 0; component < 4; component++) {
+                float a = quadClip[component];
+                float b = quadClip[4 + component];
+                float c = quadClip[8 + component];
+                float d = quadClip[12 + component];
+                float tolerance = 1.0e-4f * (Math.abs(a) + Math.abs(b) + Math.abs(c) + Math.abs(d)) + 1.0e-6f;
+                if (Math.abs(a + c - b - d) > tolerance)
+                    return false;
+            }
+            return true;
         }
 
         private int clampSteps(int steps) {
@@ -798,6 +990,11 @@ public class ESP extends Module {
         }
 
         private void addTriangle(float[] source, int a, int b, int c) {
+            if (quadInside) {
+                addProjectedTriangle(source, a, b, c);
+                return;
+            }
+
             copyVertex(source, a, clipBufferA, 0);
             copyVertex(source, b, clipBufferA, 1);
             copyVertex(source, c, clipBufferA, 2);
@@ -848,6 +1045,51 @@ public class ESP extends Module {
                         clippedScreenX[i + 1], clippedScreenY[i + 1], clippedScreenZ[i + 1]
                 );
             }
+        }
+
+        private void addProjectedTriangle(float[] source, int a, int b, int c) {
+            if (!projectToScreen(source, a, 0) || !projectToScreen(source, b, 1) || !projectToScreen(source, c, 2))
+                return;
+
+            addScreenTriangle(
+                    target,
+                    clippedScreenX[0], clippedScreenY[0], clippedScreenZ[0],
+                    clippedScreenX[1], clippedScreenY[1], clippedScreenZ[1],
+                    clippedScreenX[2], clippedScreenY[2], clippedScreenZ[2]
+            );
+        }
+
+        private boolean projectToScreen(float[] source, int index, int slot) {
+            int offset = index * 4;
+            float w = source[offset + 3];
+            if (!Float.isFinite(w) || w <= 0f)
+                return false;
+
+            float ndcX = source[offset] / w;
+            float ndcY = source[offset + 1] / w;
+            float ndcZ = source[offset + 2] / w;
+            if (!Float.isFinite(ndcX) || !Float.isFinite(ndcY) || !Float.isFinite(ndcZ))
+                return false;
+
+            ndcX = Math.clamp(ndcX, -1f, 1f);
+            ndcY = Math.clamp(ndcY, -1f, 1f);
+            ndcZ = zeroToOneDepth
+                    ? Math.clamp(ndcZ, 0f, 1f)
+                    : Math.clamp(ndcZ, -1f, 1f);
+            clippedScreenX[slot] = (ndcX * 0.5f + 0.5f) * width;
+            clippedScreenY[slot] = (1f - (ndcY * 0.5f + 0.5f)) * height;
+            clippedScreenZ[slot] = ndcZ;
+            return true;
+        }
+
+        private boolean insideFrustum(float[] vertices) {
+            for (int plane = 0; plane < CLIP_PLANE_COUNT; plane++) {
+                for (int vertex = 0; vertex < 4; vertex++) {
+                    if (clipDistance(vertices, vertex, plane) < 0f)
+                        return false;
+                }
+            }
+            return true;
         }
 
         private int clipPolygonAgainstPlane(float[] input, int inputCount, float[] output, int plane) {
@@ -1120,6 +1362,32 @@ public class ESP extends Module {
 
         private int opaqueCount(RegionCoverage coverage) {
             return regionOpaqueCount(opaquePrefix, width, coverage);
+        }
+    }
+
+    private record CellPatternKey(AlphaMask mask, float u0, float u1, float u2, float u3,
+                                  float v0, float v1, float v2, float v3) {
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof CellPatternKey key
+                    && mask == key.mask
+                    && Float.compare(u0, key.u0) == 0 && Float.compare(u1, key.u1) == 0
+                    && Float.compare(u2, key.u2) == 0 && Float.compare(u3, key.u3) == 0
+                    && Float.compare(v0, key.v0) == 0 && Float.compare(v1, key.v1) == 0
+                    && Float.compare(v2, key.v2) == 0 && Float.compare(v3, key.v3) == 0;
+        }
+
+        @Override
+        public int hashCode() {
+            int hash = System.identityHashCode(mask);
+            hash = 31 * hash + Float.floatToIntBits(u0);
+            hash = 31 * hash + Float.floatToIntBits(u1);
+            hash = 31 * hash + Float.floatToIntBits(u2);
+            hash = 31 * hash + Float.floatToIntBits(u3);
+            hash = 31 * hash + Float.floatToIntBits(v0);
+            hash = 31 * hash + Float.floatToIntBits(v1);
+            hash = 31 * hash + Float.floatToIntBits(v2);
+            return 31 * hash + Float.floatToIntBits(v3);
         }
     }
 

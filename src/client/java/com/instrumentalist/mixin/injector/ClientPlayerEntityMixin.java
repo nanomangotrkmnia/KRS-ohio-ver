@@ -7,7 +7,6 @@ import com.instrumentalist.krs.hacks.features.exploit.PortalScreen;
 import com.instrumentalist.krs.hacks.features.movement.*;
 import com.instrumentalist.krs.hacks.features.player.Phase;
 import com.instrumentalist.krs.hacks.features.player.Freecam;
-import com.instrumentalist.krs.hacks.features.render.EntityYawFix;
 import com.instrumentalist.krs.hacks.features.render.Freelook;
 import com.instrumentalist.krs.utils.move.InputUtil;
 import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
@@ -28,6 +27,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.player.ClientInput;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
@@ -162,10 +162,9 @@ public abstract class ClientPlayerEntityMixin extends Player {
             InputUtil.stop(this.input);
     }
 
-    @Inject(method = "isShiftKeyDown()Z", at = @At("HEAD"), cancellable = true)
-    private void freecamShiftKeyHook(CallbackInfoReturnable<Boolean> cir) {
-        if (ModuleManager.getModuleState(Freecam.class) && Freecam.getCanFly())
-            cir.setReturnValue(false);
+    @ModifyReturnValue(method = "isShiftKeyDown()Z", at = @At("RETURN"))
+    private boolean freecamShiftKeyHook(boolean original) {
+        return original && !(ModuleManager.getModuleState(Freecam.class) && Freecam.getCanFly());
     }
 
     @Inject(method = "raycastHitResult(FLnet/minecraft/world/entity/Entity;)Lnet/minecraft/world/phys/HitResult;", at = @At("HEAD"), cancellable = true)
@@ -225,15 +224,6 @@ public abstract class ClientPlayerEntityMixin extends Player {
         return original && !NoSlow.shouldNoSlowSneak();
     }
 
-    // Since 26.3 getViewYRot always interpolates through getYRot(F); 26.2 only did so (via super) while riding.
-    @WrapOperation(method = "getViewYRot(F)F", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/player/LocalPlayer;getYRot(F)F"))
-    private float entityHorizontalFixYawHook(LocalPlayer instance, float delta, Operation<Float> original) {
-        if (ModuleManager.getModuleState(EntityYawFix.class) && instance.isPassenger())
-            return delta == 1.0F ? this.yRotO : Mth.lerp(delta, this.yRotO, this.getYRot());
-
-        return original.call(instance, delta);
-    }
-
     @ModifyExpressionValue(method = "aiStep", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/player/ClientInput;hasForwardImpulse()Z"))
     private boolean movementFixSprintStartImpulse(boolean original) {
         if (MovementFix.shouldFixSprintCondition() || Sprint.shouldSprintOmnidirectional())
@@ -287,6 +277,36 @@ public abstract class ClientPlayerEntityMixin extends Player {
     @Inject(method = "tick", at = @At("HEAD"))
     private void invMoveHook(CallbackInfo ci) {
         InventoryMove.moveFreely();
+    }
+
+    @WrapOperation(method = "sendChanges", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/multiplayer/ClientPacketListener;send(Lnet/minecraft/network/protocol/Packet;)V"))
+    private void krs$sendPassengerRotation(ClientPacketListener instance, Packet<?> packet, Operation<Void> original) {
+        if (!(packet instanceof ServerboundMovePlayerPacket.Rot)) {
+            original.call(instance, packet);
+            return;
+        }
+
+        MotionEvent event = new MotionEvent(this.getX(), this.getY(), this.getZ(), this.getYRot(), this.getXRot(), this.onGround(), true, false, false);
+        float vanillaYaw = event.yaw;
+        float vanillaPitch = event.pitch;
+
+        if (Client.eventManager != null) Client.eventManager.call(event);
+        if (event.isCancelled()) return;
+        boolean eventRotationChanged = event.yaw != vanillaYaw || event.pitch != vanillaPitch;
+        if (Client.rotationManager != null && (Client.rotationManager.isRotating() || eventRotationChanged)) {
+            float[] fixedRotation = Client.rotationManager.normalizeRotation(event.yaw, event.pitch, this.yRotLast, this.xRotLast);
+            event.yaw = fixedRotation[0];
+            event.pitch = fixedRotation[1];
+        }
+
+        original.call(instance, new ServerboundMovePlayerPacket.Rot(event.yaw, event.pitch, this.onGround(), this.horizontalCollision));
+        this.yRotLast = event.yaw;
+        this.xRotLast = event.pitch;
+
+        MotionEvent postEvent = new MotionEvent(event.x, event.y, event.z, event.yaw, event.pitch, this.onGround(), false, false, true);
+        if (Client.eventManager != null && event.callInPost) Client.eventManager.call(postEvent);
+
+        if (Client.rotationManager != null) Client.rotationManager.postMotionVisualTick();
     }
 
     @Inject(method = "sendPosition", at = @At("HEAD"), cancellable = true)

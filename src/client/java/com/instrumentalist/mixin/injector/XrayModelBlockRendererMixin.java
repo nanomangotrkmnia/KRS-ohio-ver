@@ -1,5 +1,6 @@
 package com.instrumentalist.mixin.injector;
 
+import com.instrumentalist.krs.hacks.features.level.CaveFinder;
 import com.instrumentalist.krs.hacks.features.level.Xray;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
@@ -12,6 +13,7 @@ import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.util.ARGB;
+import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.world.level.block.state.BlockState;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -20,7 +22,7 @@ import java.util.List;
 
 @Mixin(ModelBlockRenderer.class)
 public abstract class XrayModelBlockRendererMixin {
-    private static final ThreadLocal<Float> krs$currentOpacity = ThreadLocal.withInitial(() -> 1.0F);
+    private static final ThreadLocal<float[]> krs$currentOpacity = ThreadLocal.withInitial(() -> new float[]{1.0F});
 
     @WrapOperation(
             method = "shouldRenderFace(Lnet/minecraft/client/renderer/block/BlockAndTintGetter;Lnet/minecraft/world/level/block/state/BlockState;Lnet/minecraft/core/Direction;Lnet/minecraft/core/BlockPos;)Z",
@@ -28,18 +30,28 @@ public abstract class XrayModelBlockRendererMixin {
     )
     private boolean krs$xrayShouldRenderFace(BlockState state, BlockState otherState, Direction side, Operation<Boolean> original,
                                              BlockAndTintGetter level, BlockState currentState, Direction currentSide, BlockPos neighborPos) {
+        if (!Xray.isActive()) {
+            krs$currentOpacity.get()[0] = 1.0F;
+            if (CaveFinder.isActive() && Boolean.FALSE.equals(CaveFinder.shouldDrawFace(level, state, neighborPos.relative(side.getOpposite()), side)))
+                return false;
+            return original.call(state, otherState, side);
+        }
+
         BlockPos pos = neighborPos.relative(side.getOpposite());
         Boolean shouldDrawSide = Xray.shouldDrawSide(state, pos, level);
 
         if (!Xray.isOpacityMode() || Xray.isVisible(state, pos, level)) {
-            krs$currentOpacity.set(1.0F);
+            krs$currentOpacity.get()[0] = 1.0F;
         } else {
-            krs$currentOpacity.set(Xray.getOpacityFloat());
+            krs$currentOpacity.get()[0] = Xray.getOpacityFloat();
         }
 
         if (shouldDrawSide != null) {
             return shouldDrawSide;
         }
+
+        if (Boolean.FALSE.equals(CaveFinder.shouldDrawFace(level, state, pos, side)))
+            return false;
 
         return original.call(state, otherState, side);
     }
@@ -49,8 +61,15 @@ public abstract class XrayModelBlockRendererMixin {
             at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/block/BlockQuadOutput;put(FFFLnet/minecraft/client/resources/model/geometry/BakedQuad;Lcom/mojang/blaze3d/vertex/QuadInstance;)V")
     )
     private void krs$xrayModifyOpacity(BlockQuadOutput output, float x, float y, float z, BakedQuad quad, QuadInstance instance,
-                                       Operation<Void> original) {
-        float opacity = krs$currentOpacity.get();
+                                       Operation<Void> original, BlockQuadOutput outerOutput, float outerX, float outerY, float outerZ,
+                                       BlockAndTintGetter level, BlockState state, BlockPos pos) {
+        if (Xray.shouldFullBright(state, pos, level)) {
+            instance.setLightCoords(LightCoordsUtil.FULL_BRIGHT);
+            for (int i = 0; i < 4; i++)
+                instance.setColor(i, ARGB.color(ARGB.alpha(instance.getColor(i)), 255, 255, 255));
+        }
+
+        float opacity = krs$currentOpacity.get()[0];
         if (opacity < 1.0F) {
             for (int i = 0; i < 4; i++) {
                 int color = instance.getColor(i);
@@ -76,8 +95,11 @@ public abstract class XrayModelBlockRendererMixin {
     private List<BakedQuad> krs$xrayHideUnculledQuads(BlockStateModelPart part, Direction direction, Operation<List<BakedQuad>> original,
                                                       BlockQuadOutput output, float x, float y, float z, List<BlockStateModelPart> parts,
                                                       BlockAndTintGetter level, BlockState state, BlockPos pos) {
-        Boolean shouldDrawSide = Xray.shouldDrawSide(state, pos, level);
-        if (Boolean.FALSE.equals(shouldDrawSide)) {
+        if (Xray.isActive() && Boolean.FALSE.equals(Xray.shouldDrawSide(state, pos, level))) {
+            return List.of();
+        }
+
+        if (CaveFinder.isActive() && Boolean.FALSE.equals(CaveFinder.shouldDrawFace(level, state, pos, null))) {
             return List.of();
         }
 

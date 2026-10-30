@@ -77,23 +77,23 @@ public class ModuleManager implements EventListener {
                 new AntiBlind(), new Breaker(), new CivBreak(), new Timer(), new Nuker(), new NoteBot(),
                 new Xray(), new CaveFinder(), new Scaffold(), new Blink(), new TransactionConfirmBlinker(), new ExploitPatcher(),
                 new PortalScreen(), new FullBright(), new TargetStrafe(), new DisablerModule(),
-                new OldHitting(), new Freecam(), new ClientCape(), new EntityYawFix(), new MurdererDetector(),
+                new OldHitting(), new Freecam(), new Capes(), new MurdererDetector(),
                 new NoHurtCam(), new FastBow(), new FastEat(), new Zoom(), new PathFinder(),
                 new FastBreak(), new FastPlace(), new ViewModel(), new EntityDesync(), new Step(), new AntiVoid(),
                 new AutoFish(), new NoJumpCooldown(), new AlwaysRiptide(),
                 new WorldTime(), new ChatCommands(), new Rotations(),
-                new PluginsDetector(), new NameTags(), new ESP(), new PlayerIndicator(), new MovementFix(), new LongThrow(),
+                new PluginsDetector(), new NameTags(), new ESP(), new MovementFix(), new LongThrow(),
                 new MaceExploit(), new NoPush(), new LookTP(),
                 new AntiCheatDetector(), new HackerDetector(), new PackSpoofer(),
-                new EntityFly(), new WidelyPutin(), new Imposter(), new Stalker(),
+                new EntityFly(), new WidelyPutin(), new Imposter(), new CustomModel(), new Stalker(),
                 new PacketDuper(), new SneakSpam(), new ImGui(), new ClickGui(), new ConsoleSpammer(),
-                new Reach(), new NoCombatDelay(), new AutoBypass(), new FakePinger(), new QuickMacro(),
+                new Reach(), new NoCombatDelay(), new AutoBypass(), new PingDisabler(), new QuickMacro(),
                 new FPSBobbing(), new CrossbowExploit(), new WTap(), new HatenaPiano(),
                 new SafeWalk(), new Parkour(), new AutoWalk(), new AutoRespawn(),
                 new AutoLeave(), new AutoSneak(), new MiddleClick(), new AntiAFK(),
-                new NoWeb(), new AntiLevitation(), new WaterSpeed(), new FastFall(),
-                new Spider(), new AutoRocket(), new AutoTotem(), new ItemDropChanger(),
-                new XCarry(), new PortalGodMode(), new Stasis(), new TPStealer(), new TPSurround(),
+                new NoWeb(), new NoBlockEffects(), new AntiLevitation(), new FastFall(),
+                new Spider(), new AutoRocket(), new AutoTotem(), new ItemDropChanger(), new VisualSpoofer(),
+                new XCarry(), new PortalGodMode(), new Stasis(), new ChestTP(), new SurroundTP(),
                 new BedESP(), new NoBreakReset(), new TrueSight(), new AutoTool(), new DurabilityAlert(),
                 new Freelook(), new HUDHider()
         ));
@@ -242,8 +242,6 @@ public class ModuleManager implements EventListener {
         PluginsDetector.plugins = null;
         PluginsDetector.detectedAcs = null;
         needPlReCheck = true;
-
-        ChatUtil.printChat("yolo");
     }
 
     @Override
@@ -266,14 +264,14 @@ public class ModuleManager implements EventListener {
 
         if (BlinkUtil.INSTANCE.getBlinking() && Blink.shouldBlinkOutgoing() && !BlinkUtil.INSTANCE.getLimiter() && !getModuleState(Freecam.class)) {
             if (KillAura.isSendingSpreadTeleportPacket()
-                    || TPStealer.isSendingSpreadTeleportPacket()
-                    || TPSurround.isSendingSpreadTeleportPacket())
+                    || ChestTP.isSendingSpreadTeleportPacket()
+                    || SurroundTP.isSendingSpreadTeleportPacket())
                 return;
 
             if (packet instanceof ServerboundMovePlayerPacket
                     && (KillAura.shouldSuppressMovementDuringSpreadTeleport()
-                    || TPStealer.shouldSuppressMovement()
-                    || TPSurround.shouldSuppressMovement())) {
+                    || ChestTP.shouldSuppressMovement()
+                    || SurroundTP.shouldSuppressMovement())) {
                 event.cancel();
                 return;
             }

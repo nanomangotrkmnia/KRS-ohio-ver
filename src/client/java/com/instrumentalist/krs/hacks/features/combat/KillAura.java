@@ -4,6 +4,7 @@ package com.instrumentalist.krs.hacks.features.combat;
 
 import com.instrumentalist.krs.Client;
 import com.instrumentalist.krs.events.features.HandleInputEvent;
+import com.instrumentalist.krs.events.features.Render3DEvent;
 import com.instrumentalist.krs.events.features.SendPacketEvent;
 import com.instrumentalist.krs.hacks.Module;
 import com.instrumentalist.krs.hacks.ModuleCategory;
@@ -36,12 +37,15 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.ItemUseAnimation;
 import net.minecraft.world.item.ShieldItem;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import com.instrumentalist.krs.utils.input.Keys;
+import com.instrumentalist.krs.utils.render.PathLines;
+import com.instrumentalist.krs.utils.render.RenderUtil;
 
 import java.util.*;
 
@@ -213,6 +217,18 @@ public class KillAura extends Module {
     );
 
     @Setting
+    private final BooleanValue extraParticles = new BooleanValue(
+            "Extra Particles",
+            false
+    );
+
+    @Setting
+    private final BooleanValue targetPrediction = new BooleanValue(
+            "Target Prediction",
+            true
+    );
+
+    @Setting
     public static final BooleanValue tpReach = new BooleanValue(
             "TP Reach",
             false
@@ -262,6 +278,12 @@ public class KillAura extends Module {
     private final TextValue preferTargetId = new TextValue("Prefer Target ID", "1zun4");
 
     public static Entity closestEntity = null;
+    private static final Object PREDICTION_LINE = new Object();
+    private static final int PREDICTION_TICKS = 10;
+    private static final double PREDICTION_GRAVITY = 0.08D;
+    private static final double PREDICTION_VERTICAL_DRAG = 0.98D;
+    private static final double PREDICTION_MIN_DISTANCE_SQUARED = 0.15D * 0.15D;
+    private final ArrayList<Vec3> predictionPoints = new ArrayList<>(PREDICTION_TICKS + 1);
     public static final List<Entity> multiTargets = new ArrayList<>();
     private final ArrayList<TargetCandidate> targetCandidateBuffer = new ArrayList<>();
     private final ArrayList<TargetCandidate> targetCandidatePool = new ArrayList<>();
@@ -340,6 +362,7 @@ public class KillAura extends Module {
         private final boolean onGround;
         private final boolean horizontalCollision;
         private Vec3 lastSentPosition;
+        private Entity pathTarget;
         private int nextStep;
         private int sentMovePackets;
         private int elapsedTicks;
@@ -406,6 +429,7 @@ public class KillAura extends Module {
     @Override
     public void onDisable() {
         cancelPendingTeleportSequence();
+        PathLines.hide(this, PREDICTION_LINE);
 
         if (mc.player != null)
             resetPacketUnblocking();
@@ -469,17 +493,20 @@ public class KillAura extends Module {
         boolean antiBotEnabled = ModuleManager.getModuleState(AntiBot.class);
         boolean teamsEnabled = ModuleManager.getModuleState(Teams.class);
 
+        boolean onlyPlayerTargets = onlyPlayers.get();
+        Vec3 playerEyePos = mc.player.getEyePosition();
+
         for (Entity entity : mc.level.entitiesForRendering()) {
             if (!(entity instanceof LivingEntity livingEntity)
                     || livingEntity.isDeadOrDying()
                     || entity instanceof ArmorStand
                     || entity instanceof LocalPlayer
-                    || BehaviorUtils.isBot(livingEntity, antiBotEnabled)
-                    || BehaviorUtils.isTeammate(livingEntity, teamsEnabled)
-                    || onlyPlayers.get() && !(entity instanceof Player)) continue;
+                    || onlyPlayerTargets && !(entity instanceof Player)) continue;
 
-            double squaredDistance = EntityExtension.squaredBoxedDistanceTo(entity, mc.player);
-            if (squaredDistance > realTargetReachSquared) continue;
+            double squaredDistance = EntityExtension.squaredBoxedDistanceTo(entity, playerEyePos);
+            if (squaredDistance > realTargetReachSquared
+                    || BehaviorUtils.isBot(livingEntity, antiBotEnabled)
+                    || BehaviorUtils.isTeammate(livingEntity, teamsEnabled)) continue;
 
             TargetCandidate candidate = acquireTargetCandidate(
                     entity,
@@ -918,9 +945,11 @@ public class KillAura extends Module {
     }
 
     private void renderParticles(Entity target) {
-        mc.player.magicCrit(target);
-        if (mc.player.getDeltaMovement().y < -0.08)
-            mc.player.crit(target);
+        if (extraParticles.get()) {
+            mc.player.magicCrit(target);
+            if (mc.player.getDeltaMovement().y < -0.08)
+                mc.player.crit(target);
+        }
     }
 
     private boolean attackCooldownMath(Entity target) {
@@ -1612,6 +1641,8 @@ public class KillAura extends Module {
             return;
         }
 
+        sequence.pathTarget = goStep.target();
+        PathLines.show(this, goStep.target(), from, path);
         sequence.totalMovePackets += path.size() - plannedCount;
         for (int i = 0; i < path.size(); i++)
             sequence.steps.add(sequence.nextStep + i, new TeleportMoveStep(path.get(i)));
@@ -1634,6 +1665,8 @@ public class KillAura extends Module {
             sequence.nextStep++;
             return true;
         }
+
+        PathLines.show(this, sequence.pathTarget != null ? sequence.pathTarget : this, sequence.lastSentPosition, path);
 
         for (Vec3 position : path) {
             if (!lastTick && sequence.sentMovePackets >= movePacketTarget)
@@ -1714,6 +1747,53 @@ public class KillAura extends Module {
             return;
 
         sendTeleportMovePacket(current, sequence.onGround, sequence.horizontalCollision);
+    }
+
+    @Override
+    public void onRender3D(Render3DEvent event) {
+        Entity target = closestEntity;
+        if (!targetPrediction.get() || target == null || mc.player == null || mc.level == null || target.isRemoved() || !target.isAlive()) {
+            PathLines.hide(this, PREDICTION_LINE);
+            return;
+        }
+
+        predictionPoints.clear();
+        Vec3 position = RenderUtil.INSTANCE.getLerpedPos(target, event.partialTicks);
+        predictionPoints.add(position);
+        double velocityX = target.getX() - target.xo;
+        double velocityY = target.getY() - target.yo;
+        double velocityZ = target.getZ() - target.zo;
+        boolean grounded = target.onGround();
+        if (grounded)
+            velocityY = 0.0D;
+
+        for (int tick = 0; tick < PREDICTION_TICKS; tick++) {
+            if (!grounded)
+                velocityY = (velocityY - PREDICTION_GRAVITY) * PREDICTION_VERTICAL_DRAG;
+
+            Vec3 next = position.add(velocityX, velocityY, velocityZ);
+            BlockHitResult hit = mc.level.clip(new ClipContext(position, next, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, target));
+            if (hit.getType() != HitResult.Type.MISS) {
+                position = hit.getLocation();
+                predictionPoints.add(position);
+                if (hit.getDirection() != Direction.UP)
+                    break;
+
+                grounded = true;
+                velocityY = 0.0D;
+                continue;
+            }
+
+            position = next;
+            predictionPoints.add(position);
+        }
+
+        if (predictionPoints.getLast().distanceToSqr(predictionPoints.getFirst()) < PREDICTION_MIN_DISTANCE_SQUARED) {
+            PathLines.hide(this, PREDICTION_LINE);
+            return;
+        }
+
+        PathLines.show(this, PREDICTION_LINE, null, predictionPoints);
     }
 
     private static boolean isSameExactPosition(Vec3 first, Vec3 second) {
@@ -1848,6 +1928,7 @@ public class KillAura extends Module {
                 return;
 
             if (resolvedPath != null) {
+                PathLines.show(this, target, mc.player.position(), resolvedPath.positions());
                 for (Vec3 path : resolvedPath.positions()) {
                     PacketUtil.sendPacket(new ServerboundMovePlayerPacket.Pos(path.x, path.y, path.z, tpOnGroundPacket.get(), mc.player.horizontalCollision));
                 }
@@ -1864,6 +1945,7 @@ public class KillAura extends Module {
                     ? resolvedPath.arrivalPosition()
                     : resolvedPath.positions().getLast();
             ArrayList<Vec3> returnPath = resolveReturnPath(lastSent, mc.player.position());
+            PathLines.show(this, target, lastSent, returnPath);
             for (Vec3 path : returnPath) {
                 PacketUtil.sendPacket(new ServerboundMovePlayerPacket.Pos(
                         path.x,

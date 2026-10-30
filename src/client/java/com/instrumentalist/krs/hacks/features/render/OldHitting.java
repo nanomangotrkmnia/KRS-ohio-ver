@@ -7,6 +7,7 @@ import com.instrumentalist.krs.hacks.ModuleCategory;
 import com.instrumentalist.krs.hacks.ModuleManager;
 import com.instrumentalist.krs.hacks.features.combat.KillAura;
 import com.instrumentalist.krs.utils.math.ToolUtil;
+import com.instrumentalist.krs.utils.value.BooleanValue;
 import com.instrumentalist.krs.utils.value.ListValue;
 import net.minecraft.client.model.geom.ModelPart;
 import net.minecraft.world.entity.HumanoidArm;
@@ -20,10 +21,13 @@ import java.util.Locale;
 public class OldHitting extends Module {
 
     @Setting
-    public static final ListValue mode = new ListValue("Mode", new String[]{"Vanilla", "Push", "Dash", "Swang", "Swonk"}, "Vanilla");
+    public static final ListValue mode = new ListValue("Mode", new String[]{"Vanilla", "Push", "Dash", "Swang", "Swank", "Swonk", "Ethr", "Spin"}, "Vanilla");
 
     @Setting
     private static final ListValue thirdPersonMode = new ListValue("Third Person Mode", new String[]{"Vanilla", "Legacy Vanilla"}, "Legacy Vanilla");
+
+    @Setting
+    private static final BooleanValue noEquipAnimation = new BooleanValue("No Equip Animation", true);
 
     private static boolean canBlock = false;
 
@@ -103,6 +107,10 @@ public class OldHitting extends Module {
                 arm.zRot = 0.0f;
             }
         }
+    }
+
+    public static boolean shouldSkipEquipAnimation() {
+        return noEquipAnimation.get() && shouldBlock();
     }
 
     public static boolean shouldUseLegacyVanillaThirdPerson() {

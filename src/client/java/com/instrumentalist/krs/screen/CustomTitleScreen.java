@@ -4,12 +4,13 @@ import com.instrumentalist.krs.utils.IMinecraft;
 import com.instrumentalist.krs.Client;
 import com.instrumentalist.krs.utils.GuiInputBlocker;
 import com.instrumentalist.krs.utils.audio.Mp3MusicPlayer;
-import com.instrumentalist.krs.utils.math.Interpolation;
+import com.instrumentalist.krs.hacks.features.render.Interface;
 import com.instrumentalist.krs.utils.nanovg.NanoVGManager;
 import com.instrumentalist.krs.utils.nanovg.NVGFonts;
 import com.instrumentalist.krs.utils.network.FileUtil;
 import com.instrumentalist.krs.utils.render.GraphicsApiCompatibility;
 import com.instrumentalist.krs.utils.render.NanoVGTheme;
+import com.instrumentalist.krs.utils.render.Shader2DRenderer;
 import com.mojang.blaze3d.platform.cursor.CursorType;
 import com.mojang.blaze3d.platform.cursor.CursorTypes;
 import com.mojang.realmsclient.RealmsMainScreen;
@@ -42,6 +43,10 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
     private static final float MUSIC_SLIDER_TRACK_HEIGHT = 7f;
     private static final Color BUTTON_IDLE = NanoVGTheme.base(168);
     private static final Color BUTTON_HOVERED = NanoVGTheme.base(210);
+    private static final Color HOVER_LINE = new Color(255, 215, 0, 220);
+    private static final float STARTUP_LOAD_BAR_FADE_SECONDS = 0.25f;
+    private static float startupLoadBarAlpha;
+    private static long startupLoadBarFadeNanos;
     private static final String RELEASES_URL = "https://github.com/Aspw-w/Krs/releases";
 
     private boolean musicVolumeSliderDragging;
@@ -54,7 +59,7 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
     private final MenuButton realmsButton = new MenuButton("Realms");
     private final MenuButton friendsButton = new MenuButton("Friends");
     private final MenuButton optionsButton = new MenuButton("Options");
-    private final MenuButton updateAvailableButton = new MenuButton("Update Here");
+    private final MenuButton updateAvailableButton = new MenuButton("Update");
     private final MenuButton exitButton = new MenuButton("Exit");
     private final List<MenuButton> menuButtons = List.of(
             singlePlayerButton,
@@ -76,6 +81,45 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
 
     public static float bgOffsetX = 0;
     public static float bgOffsetY = 0;
+    private static float bgParallaxScreenWidth = -1f;
+    private static float bgParallaxScreenHeight = -1f;
+    private static boolean bgParallaxHoldCenter;
+    private static float bgParallaxHoldMouseX;
+    private static float bgParallaxHoldMouseY;
+
+    public static void stepBackgroundParallax(float targetX, float targetY, float amount) {
+        if (!Float.isFinite(targetX) || !Float.isFinite(targetY) || !Float.isFinite(amount))
+            return;
+
+        float screenWidth = NanoVGManager.getScaledScreenWidth();
+        float screenHeight = NanoVGManager.getScaledScreenHeight();
+        if (!(screenWidth > 0f) || !(screenHeight > 0f))
+            return;
+
+        if (screenWidth != bgParallaxScreenWidth || screenHeight != bgParallaxScreenHeight
+                || !Float.isFinite(bgOffsetX) || !Float.isFinite(bgOffsetY)) {
+            bgParallaxScreenWidth = screenWidth;
+            bgParallaxScreenHeight = screenHeight;
+            bgOffsetX = screenWidth / 2f;
+            bgOffsetY = screenHeight / 2f;
+            bgParallaxHoldCenter = true;
+            bgParallaxHoldMouseX = targetX;
+            bgParallaxHoldMouseY = targetY;
+            return;
+        }
+
+        if (bgParallaxHoldCenter) {
+            if (Math.abs(targetX - bgParallaxHoldMouseX) < 0.5f && Math.abs(targetY - bgParallaxHoldMouseY) < 0.5f) {
+                targetX = screenWidth / 2f;
+                targetY = screenHeight / 2f;
+            } else {
+                bgParallaxHoldCenter = false;
+            }
+        }
+
+        bgOffsetX += (targetX - bgOffsetX) * amount;
+        bgOffsetY += (targetY - bgOffsetY) * amount;
+    }
 
     public CustomTitleScreen(Component title) {
         super(title);
@@ -87,9 +131,19 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
             Client.configManager.setMainMenuMusicFrame(frame, true);
     }
 
+    public static void resetBackgroundState() {
+        bgParallaxScreenWidth = -1f;
+        bgParallaxScreenHeight = -1f;
+        bgParallaxHoldCenter = false;
+        mc.mouseHandler.resyncMousePosition();
+        mc.mouseHandler.setIgnoreFirstMove();
+        Shader2DRenderer.INSTANCE.invalidateBackdrop();
+    }
+
     @Override
     public void added() {
         super.added();
+        resetBackgroundState();
         syncMainMenuMusicVolume();
         MAIN_MENU_MUSIC.playLoop();
     }
@@ -140,14 +194,15 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
 
     private void renderUiButton(NVGU vg, MenuButton state) {
         Color baseColor = state.hovered ? BUTTON_HOVERED : BUTTON_IDLE;
-        vg.roundedRectangle(state.x - 110f, state.y - 34f, 220f, 38f, 14f, baseColor);
+        vg.roundedRectangle(state.x - 110f, state.y - 34f, 220f, 38f, NanoVGTheme.RADIUS_PANEL, baseColor);
 
         if (state.animation > 1f) {
-            vg.roundedRectangle(state.x - state.animation, state.y - 2.5f, state.animation * 2f, 3f, 2f, new Color(255, 255, 255, state.hovered ? 230 : 170));
+            Color gradientColor = state.hovered ? HOVER_LINE : Interface.getFadedColor(0, 1);
+            vg.roundedRectangle(state.x - state.animation, state.y - 2.5f, state.animation * 2f, 3f, 2f, gradientColor);
         }
 
         NVGFont font = state.fontSize > 22f ? NVGFonts.INTER_MEDIUM : NVGFonts.INTER;
-        font.drawText(state.label, state.x, state.y - 15f - (state.fontSize - 21f), state.fontSize, Color.WHITE, Alignment.CENTER_MIDDLE, true);
+        font.drawText(state.label, state.x, state.y - 15f - (state.fontSize - 21f), state.fontSize, state.hovered ? Color.YELLOW : Color.WHITE, Alignment.CENTER_MIDDLE, true);
     }
 
     private void renderMusicVolumeSlider(NVGU vg, float centerX, float mouseX, float mouseY) {
@@ -297,14 +352,41 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
     }
 
     public static void renderStartupLoadBarIfNeeded(NanoVGManager manager) {
-        if (manager == null || !shouldRenderStartupLoadBar())
+        if (manager == null)
             return;
 
-        manager.renderImmediate(CustomTitleScreen::renderStartupLoadBar);
+        float alpha = updateStartupLoadBarFade();
+        if (alpha <= 0.001f)
+            return;
+
+        manager.renderImmediate(vg -> vg.globalAlpha(alpha, () -> renderStartupLoadBar(vg)));
     }
 
     public static boolean shouldRenderStartupLoadBar() {
         return mc.gui.screen() instanceof CustomTitleScreen && mc.gui.overlay() != null;
+    }
+
+    public static boolean isStartupLoadBarVisible() {
+        return shouldRenderStartupLoadBar()
+                || startupLoadBarAlpha > 0.001f && mc.gui.screen() instanceof CustomTitleScreen;
+    }
+
+    private static float updateStartupLoadBarFade() {
+        long now = System.nanoTime();
+        if (!(mc.gui.screen() instanceof CustomTitleScreen)) {
+            startupLoadBarAlpha = 0f;
+            startupLoadBarFadeNanos = now;
+            return 0f;
+        }
+
+        float target = shouldRenderStartupLoadBar() ? 1f : 0f;
+        float seconds = Math.clamp((now - startupLoadBarFadeNanos) / 1_000_000_000f, 0f, 0.05f);
+        startupLoadBarFadeNanos = now;
+        float step = seconds / STARTUP_LOAD_BAR_FADE_SECONDS;
+        startupLoadBarAlpha = target > startupLoadBarAlpha
+                ? Math.min(target, startupLoadBarAlpha + step)
+                : Math.max(target, startupLoadBarAlpha - step);
+        return startupLoadBarAlpha * startupLoadBarAlpha * (3f - 2f * startupLoadBarAlpha);
     }
 
     private static void renderStartupLoadBar(NVGU vg) {
@@ -320,10 +402,10 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
         float trackHeight = 5f;
 
         vg.beginEffectBatch();
-        NanoVGTheme.renderPanelEffects(vg, panelX, panelY, panelWidth, panelHeight, 14f, 1f);
+        NanoVGTheme.renderPanelEffects(vg, panelX, panelY, panelWidth, panelHeight, NanoVGTheme.RADIUS_PANEL, 1f);
         vg.flushEffectBatch();
 
-        NanoVGTheme.renderPanel(vg, panelX, panelY, panelWidth, panelHeight, 14f, 1f);
+        NanoVGTheme.renderPanel(vg, panelX, panelY, panelWidth, panelHeight, NanoVGTheme.RADIUS_PANEL, 1f);
         NVGFonts.INTER_MEDIUM.drawText("Loading", panelX + 22f, panelY + 12f, 15f, new Color(255, 255, 255, 230), Alignment.LEFT_TOP, true);
         vg.roundedRectangle(trackX, trackY, trackWidth, trackHeight, 3f, NanoVGTheme.base(90));
 
@@ -332,7 +414,7 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
         float markerX = trackX - markerWidth + (trackWidth + markerWidth * 2f) * phase;
 
         vg.scissor(trackX, trackY, trackWidth, trackHeight, () ->
-                vg.roundedRectangle(markerX, trackY, markerWidth, trackHeight, 3f, new Color(255, 255, 255, 230))
+                vg.roundedRectangle(markerX, trackY, markerWidth, trackHeight, 3f, HOVER_LINE)
         );
     }
 
@@ -354,11 +436,10 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
             float centerY = screenHeight / 2f;
 
             if (!isMinecraftMouseBlocked()) {
-                float targetBgOffsetX = NanoVGManager.toScaledMouseX(mouseX);
-                float targetBgOffsetY = NanoVGManager.toScaledMouseY(mouseY);
+                float targetBgOffsetX = NanoVGManager.toScaledMouseX(mc.mouseHandler.getScaledXPos(mc.getWindow()));
+                float targetBgOffsetY = NanoVGManager.toScaledMouseY(mc.mouseHandler.getScaledYPos(mc.getWindow()));
 
-                bgOffsetX = Interpolation.INSTANCE.lerp(bgOffsetX, targetBgOffsetX, 0.03f);
-                bgOffsetY = Interpolation.INSTANCE.lerp(bgOffsetY, targetBgOffsetY, 0.03f);
+                stepBackgroundParallax(targetBgOffsetX, targetBgOffsetY, 0.03f);
             }
 
             if (ensureTexture(vg, "title_screen", "assets/krs/title.png")) {
@@ -383,14 +464,14 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
             float iconSize = 80f;
 
             vg.beginEffectBatch();
-            NanoVGTheme.renderPanelEffects(vg, menuX, menuY, menuWidth, menuHeight, 18f, 1f);
-            NanoVGTheme.renderPanelEffects(vg, iconX, iconY, iconSize, iconSize, 16f, 1f);
+            NanoVGTheme.renderPanelEffects(vg, menuX, menuY, menuWidth, menuHeight, NanoVGTheme.RADIUS_MENU, 1f);
+            NanoVGTheme.renderPanelEffects(vg, iconX, iconY, iconSize, iconSize, NanoVGTheme.RADIUS_MENU, 1f);
             vg.flushEffectBatch();
 
-            NanoVGTheme.renderPanel(vg, menuX, menuY, menuWidth, menuHeight, 18f, 1f);
-            NanoVGTheme.renderPanel(vg, iconX, iconY, iconSize, iconSize, 16f, 1f);
+            NanoVGTheme.renderPanel(vg, menuX, menuY, menuWidth, menuHeight, NanoVGTheme.RADIUS_MENU, 1f);
+            NanoVGTheme.renderPanel(vg, iconX, iconY, iconSize, iconSize, NanoVGTheme.RADIUS_MENU, 1f);
             if (ensureTexture(vg, "icon", "assets/krs/icon.png"))
-                vg.texturedRoundedRectangle(iconX, iconY, iconSize, iconSize, 16f, "icon");
+                vg.texturedRoundedRectangle(iconX, iconY, iconSize, iconSize, NanoVGTheme.RADIUS_MENU, "icon");
 
             NVGFonts.INTER_MEDIUM.drawText("Welcome to Krs Client (v" + Client.clientVersion + ")", 8f, screenHeight - 8f, 22f, Color.WHITE, Alignment.LEFT_BOTTOM, true);
             NVGFonts.INTER_MEDIUM.drawText(getCurrentTime(), screenWidth - 10f, 10f, 22f, Color.WHITE, Alignment.RIGHT_TOP, true);
@@ -406,7 +487,7 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
 
             vg.beginEffectBatch();
             for (MenuButton state : visibleMenuButtons) {
-                NanoVGTheme.renderPanelEffects(vg, state.x - 110f, state.y - 34f, 220f, 38f, 14f, state.hovered ? 1f : 0.92f);
+                NanoVGTheme.renderPanelEffects(vg, state.x - 110f, state.y - 34f, 220f, 38f, NanoVGTheme.RADIUS_PANEL, state.hovered ? 1f : 0.92f);
             }
             vg.flushEffectBatch();
 
@@ -417,7 +498,7 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
             Client.notificationManager.renderNotifications(vg);
         };
 
-        if (mc.gui.screen() == this)
+        if (mc.gui.screen() == this || mc.gui.screen() instanceof NanoVGClickGuiScreen)
             Client.nanoVgManager.load(renderer);
         else
             Client.nanoVgManager.loadBeforeGui(renderer);
@@ -473,7 +554,7 @@ public class CustomTitleScreen extends Screen implements IMinecraft {
                             mc.gui.setScreen(new OptionsScreen(this, mc.options));
                             return true;
 
-                        case "Update Here":
+                        case "Update":
                             FileUtil.INSTANCE.openInBrowser(RELEASES_URL);
                             return true;
 

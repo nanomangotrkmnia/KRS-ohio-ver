@@ -12,6 +12,7 @@ import com.instrumentalist.krs.utils.nanovg.NVGFonts;
 import com.instrumentalist.krs.utils.nanovg.NanoVGManager;
 import com.instrumentalist.krs.utils.network.FileUtil;
 import com.instrumentalist.krs.utils.render.NanoVGTheme;
+import com.instrumentalist.krs.utils.render.Shader2DRenderer;
 import com.mojang.blaze3d.platform.cursor.CursorType;
 import com.mojang.blaze3d.platform.cursor.CursorTypes;
 import com.instrumentalist.krs.utils.value.BooleanValue;
@@ -28,12 +29,16 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.CharacterEvent;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.client.multiplayer.PlayerInfo;
+import net.minecraft.client.player.AbstractClientPlayer;
+import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.chat.Component;
 import com.instrumentalist.krs.utils.input.Keys;
 import org.nvgu.NVGU;
 import org.nvgu.util.Alignment;
 import org.nvgu.util.Border;
 import org.nvgu.util.NVGFont;
+import xyz.breadloaf.imguimc.customwindow.ModuleRenderable;
 
 import java.awt.Color;
 import java.io.File;
@@ -83,6 +88,11 @@ public class NanoVGClickGuiScreen extends Screen {
     private static ModuleCategory rememberedSelectedCategory = ModuleCategory.Combat;
     private static boolean rememberedConfigView;
     private static ConfigTab rememberedConfigTab = ConfigTab.MODULE;
+    private static boolean rememberedCommandView;
+    private static CommandTab rememberedCommandTab = CommandTab.COMMAND;
+    private static final int MAX_COMMAND_INPUT_LENGTH = 256;
+    private static final int MAX_COMMAND_HISTORY = 50;
+    private static final List<String> commandHistory = new ArrayList<>();
     private static Module rememberedOpenedListModule;
     private static ListValue rememberedOpenedListValue;
     private static float rememberedListScroll;
@@ -120,6 +130,14 @@ public class NanoVGClickGuiScreen extends Screen {
     private ModuleCategory selectedCategory = ModuleCategory.Combat;
     private boolean configView;
     private ConfigTab selectedConfigTab = ConfigTab.MODULE;
+    private boolean commandView;
+    private CommandTab selectedCommandTab = CommandTab.COMMAND;
+    private String commandInput = "";
+    private int commandHistoryIndex = -1;
+    private String lastSeenCommandLog;
+    private int lastSeenCommandLogCount = -1;
+    private float commandLogWrapWidth = -1f;
+    private final Map<String, List<String>> commandLogLineCache = new IdentityHashMap<>();
     private String searchQuery = "";
     private String newConfigName = "";
     private String renameConfigName = "";
@@ -153,6 +171,7 @@ public class NanoVGClickGuiScreen extends Screen {
     private Rect settingsPanelScrollbarTrackRect = new Rect(0f, 0f, 0f, 0f);
     private Rect settingsPanelScrollbarThumbRect = new Rect(0f, 0f, 0f, 0f);
     private TextFocus textFocus = TextFocus.NONE;
+    private boolean textInputActive;
     private TextValue focusedTextValue;
     private Module focusedTextModule;
     private SettingValue<?> focusedNumberValue;
@@ -227,7 +246,17 @@ public class NanoVGClickGuiScreen extends Screen {
         screenMouseY = NanoVGManager.toScaledMouseY(mouseY);
         updateScaledMouse();
         context.requestCursor(resolveHoverCursor());
+        syncTextInput();
         Client.nanoVgManager.load(nanoVgRenderer);
+    }
+
+    private void syncTextInput() {
+        boolean wantsTextInput = textFocus != TextFocus.NONE;
+        if (wantsTextInput == textInputActive || minecraft == null)
+            return;
+
+        textInputActive = wantsTextInput;
+        minecraft.onTextInputFocusChange(this, wantsTextInput);
     }
 
     @Override
@@ -313,12 +342,20 @@ public class NanoVGClickGuiScreen extends Screen {
                     storeCurrentCategoryScroll();
                     if (tab.isConfig()) {
                         configView = true;
+                        commandView = false;
                         selectedConfigTab = tab.configTab();
                         searchQuery = "";
                         resetListScroll();
+                    } else if (tab.isCommand()) {
+                        configView = false;
+                        commandView = true;
+                        selectedCommandTab = tab.commandTab();
+                        searchQuery = "";
+                        resetCommandScroll();
                     } else {
                         selectedCategory = tab.category();
                         configView = false;
+                        commandView = false;
                         searchQuery = "";
                         restoreCategoryScroll(selectedCategory);
                     }
@@ -465,8 +502,15 @@ public class NanoVGClickGuiScreen extends Screen {
                 return true;
             }
 
+            if (textFocus == TextFocus.COMMAND && (key == Keys.KEY_UP || key == Keys.KEY_DOWN)) {
+                browseCommandHistory(key == Keys.KEY_UP ? -1 : 1);
+                return true;
+            }
+
             if (key == Keys.KEY_ENTER || key == Keys.KEY_KP_ENTER) {
-                if (textFocus == TextFocus.CONFIG_NAME)
+                if (textFocus == TextFocus.COMMAND)
+                    runCommandInput();
+                else if (textFocus == TextFocus.CONFIG_NAME)
                     createConfigFromInput();
                 else if (textFocus == TextFocus.CONFIG_RENAME) {
                     if (commitConfigRename())
@@ -548,7 +592,8 @@ public class NanoVGClickGuiScreen extends Screen {
 
     @Override
     public boolean isPauseScreen() {
-        return false;
+        Screen backgroundScreen = getBackgroundScreen();
+        return backgroundScreen != null && backgroundScreen.isPauseScreen();
     }
 
     @Override
@@ -579,8 +624,6 @@ public class NanoVGClickGuiScreen extends Screen {
 
     @Override
     public void removed() {
-        // Server-driven screen changes bypass onClose(). Persist the current layout
-        // here as well so reopening ClickGui restores the exact same view state.
         rememberUiState();
         activeSlider = null;
         pressedControl = null;
@@ -590,6 +633,7 @@ public class NanoVGClickGuiScreen extends Screen {
         bindingModule = null;
         bindingValue = null;
         clearTextFocus();
+        syncTextInput();
         resetHoverCursor();
         super.removed();
     }
@@ -627,16 +671,18 @@ public class NanoVGClickGuiScreen extends Screen {
         selectedCategory = rememberedSelectedCategory == null ? ModuleCategory.Combat : rememberedSelectedCategory;
         configView = rememberedConfigView;
         selectedConfigTab = rememberedConfigTab == null ? ConfigTab.MODULE : rememberedConfigTab;
+        commandView = rememberedCommandView && !configView;
+        selectedCommandTab = rememberedCommandTab == null ? CommandTab.COMMAND : rememberedCommandTab;
         openedListModule = rememberedOpenedListModule;
         openedListValue = rememberedOpenedListValue;
-        ScrollState selectedScroll = !configView && selectedCategory != null ? categoryScrolls.get(selectedCategory) : null;
+        ScrollState selectedScroll = isModuleView() && selectedCategory != null ? categoryScrolls.get(selectedCategory) : null;
         if (selectedScroll != null) {
             listScroll = selectedScroll.listScroll();
             targetListScroll = selectedScroll.targetListScroll();
         } else {
             targetListScroll = rememberedTargetListScroll;
             listScroll = rememberedListScroll;
-            if (!configView && selectedCategory != null)
+            if (isModuleView() && selectedCategory != null)
                 categoryScrolls.put(selectedCategory, new ScrollState(listScroll, targetListScroll));
         }
         settingsPanelScroll = rememberedSettingsPanelScroll;
@@ -672,6 +718,8 @@ public class NanoVGClickGuiScreen extends Screen {
         rememberedSelectedCategory = selectedCategory;
         rememberedConfigView = configView;
         rememberedConfigTab = selectedConfigTab;
+        rememberedCommandView = commandView;
+        rememberedCommandTab = selectedCommandTab;
         rememberedOpenedListModule = openedListModule;
         rememberedOpenedListValue = openedListValue;
         rememberedListScroll = listScroll;
@@ -726,6 +774,8 @@ public class NanoVGClickGuiScreen extends Screen {
 
         if (staticFallbackBackdrop)
             renderTitleBackdrop(vg, screenWidth, screenHeight);
+        else if (hasBackgroundScreen())
+            Shader2DRenderer.INSTANCE.beginFrame();
 
         vg.globalAlpha(easeOut(openProgress), () -> {
             renderPanelEffects(vg, panel.x, panel.y, panel.width, panel.height);
@@ -769,7 +819,7 @@ public class NanoVGClickGuiScreen extends Screen {
     }
 
     private void storeCurrentCategoryScroll() {
-        if (configView || !searchQuery.isBlank() || selectedCategory == null)
+        if (!isModuleView() || !searchQuery.isBlank() || selectedCategory == null)
             return;
 
         categoryScrolls.put(selectedCategory, new ScrollState(listScroll, targetListScroll));
@@ -901,8 +951,7 @@ public class NanoVGClickGuiScreen extends Screen {
 
     private void renderTitleBackdrop(NVGU vg, float width, float height) {
         if (ensureTexture(vg, "title_screen", "assets/krs/title.png")) {
-            CustomTitleScreen.bgOffsetX = approach(CustomTitleScreen.bgOffsetX, screenMouseX, Math.clamp(0.03f * frameDelta, 0f, 1f));
-            CustomTitleScreen.bgOffsetY = approach(CustomTitleScreen.bgOffsetY, screenMouseY, Math.clamp(0.03f * frameDelta, 0f, 1f));
+            CustomTitleScreen.stepBackgroundParallax(screenMouseX, screenMouseY, Math.clamp(0.03f * frameDelta, 0f, 1f));
 
             vg.texturedRectangle(0f, 0f, width * 2f, height * 2f, "title_screen");
             vg.save();
@@ -946,12 +995,14 @@ public class NanoVGClickGuiScreen extends Screen {
         renderHeader(vg, x, y, width);
         Rect content = panelContentBounds(new Rect(x, y, width, height));
         NanoVGTheme.renderCompact(vg, content.x, content.y, CATEGORY_SIDEBAR_WIDTH, content.height, u(NanoVGTheme.RADIUS_HUD), 1f, COMPACT_BACKGROUND_ALPHA_OFFSET);
-        renderTabs(vg, content.x, content.y, CATEGORY_SIDEBAR_WIDTH);
+        renderTabs(vg, content.x, content.y, CATEGORY_SIDEBAR_WIDTH, content.height);
 
         Rect mainContent = mainContentBounds(content);
         float listWidth = mainContent.width - settingsDockReservedWidth(content.width, settingsDockReveal);
         int visibleCount = configView
                 ? renderConfigList(vg, mainContent.x, mainContent.y, listWidth, mainContent.height)
+                : commandView
+                ? renderCommandList(vg, mainContent.x, mainContent.y, listWidth, mainContent.height)
                 : renderModuleList(vg, mainContent.x, mainContent.y, listWidth, mainContent.height);
         renderFooter(vg, x + PANEL_PADDING, y + height - PANEL_FOOTER_HEIGHT - u(4f), width - PANEL_PADDING * 2f, visibleCount);
     }
@@ -1037,14 +1088,14 @@ public class NanoVGClickGuiScreen extends Screen {
                                 SWITCH_HEIGHT
                         );
                         float headerNameX = enableRect.x + enableRect.width + u(8f);
-                        NVGFonts.INTER.drawText(
-                                fitText(module.moduleName, NVGFonts.INTER, headerFont, Math.max(u(40f), settingsPanelCloseRect.x - u(8f) - headerNameX)),
+                        NVGFonts.INTER_MEDIUM.drawText(
+                                fitText(module.moduleName, NVGFonts.INTER_MEDIUM, headerFont,Math.max(u(40f), settingsPanelCloseRect.x - u(8f) - headerNameX)),
                                 headerNameX,
                                 settingsPanelRect.y + u(14f),
                                 headerFont,
                                 NanoVGTheme.TEXT,
                                 Alignment.LEFT_TOP,
-                                false
+                                true
                         );
                         if (settingsPanelModule != null)
                             addControl(ControlType.MODULE_ENABLED, enableRect.expand(u(4f), u(6f)), module, null, 0);
@@ -1067,7 +1118,7 @@ public class NanoVGClickGuiScreen extends Screen {
                                 headerFont,
                                 NanoVGTheme.TEXT,
                                 Alignment.LEFT_TOP,
-                                false
+                                true
                         );
                     }
 
@@ -1088,7 +1139,7 @@ public class NanoVGClickGuiScreen extends Screen {
                             font(12f),
                             mix(alpha(176, 186, 196, 230), alpha(255, 195, 195, 245), closeProgress),
                             Alignment.CENTER_MIDDLE,
-                            false
+                            true
                     );
 
                     NanoVGTheme.renderCompact(vg, settingsListX, settingsListY, settingsListWidth, settingsListHeight, u(NanoVGTheme.RADIUS_HUD), 1f, COMPACT_BACKGROUND_ALPHA_OFFSET);
@@ -1181,7 +1232,7 @@ public class NanoVGClickGuiScreen extends Screen {
 
         boolean closeHovered = closeRect.contains(scaledMouseX, scaledMouseY);
         vg.roundedRectangle(closeRect.x, closeRect.y, closeRect.width, closeRect.height, u(4f), closeHovered ? alpha(255, 90, 90, 120) : alpha(255, 255, 255, 18));
-        NVGFonts.ICON.drawText(MaterialIcon.CLOSE, closeRect.centerX(), closeRect.centerY() - u(1f), font(14f), closeHovered ? NanoVGTheme.TEXT : NanoVGTheme.muted(220), Alignment.CENTER_MIDDLE, false);
+        NVGFonts.ICON.drawText(MaterialIcon.CLOSE, closeRect.centerX(), closeRect.centerY() - u(1f), font(14f), closeHovered ? NanoVGTheme.TEXT : NanoVGTheme.muted(220), Alignment.CENTER_MIDDLE, true);
 
         vg.rectangle(x + u(10f), y + PANEL_HEADER_HEIGHT - u(1f), width - u(20f), u(1f), alpha(255, 255, 255, 40));
     }
@@ -1191,7 +1242,7 @@ public class NanoVGClickGuiScreen extends Screen {
         boolean hovered = rect.contains(scaledMouseX, scaledMouseY);
         vg.roundedRectangle(rect.x, rect.y, rect.width, rect.height, u(5f), alpha(255, 255, 255, focused ? 30 : hovered ? 23 : 16));
         vg.roundedRectangleBorder(rect.x, rect.y, rect.width, rect.height, u(5f), u(1f), focused ? NanoVGTheme.inputFocus(120) : alpha(255, 255, 255, 30), Border.INSIDE);
-        NVGFonts.ICON.drawText(MaterialIcon.SEARCH, rect.x + u(7f), rect.y + u(3f), font(12f), focused ? NanoVGTheme.INPUT_FOCUS : alpha(176, 186, 196, 220), Alignment.LEFT_TOP, false);
+        NVGFonts.ICON.drawText(MaterialIcon.SEARCH, rect.x + u(7f), rect.y + u(3f), font(12f), focused ? NanoVGTheme.INPUT_FOCUS : alpha(176, 186, 196, 220), Alignment.LEFT_TOP, true);
 
         String text = inputText(searchQuery, focused, "Search");
         Color color = searchQuery.isBlank() && !focused ? alpha(120, 130, 140, 205) : alpha(255, 255, 255, 235);
@@ -1200,7 +1251,7 @@ public class NanoVGClickGuiScreen extends Screen {
         String visibleText = fitText(text, NVGFonts.INTER, searchFont, rect.width - textReserve);
         rememberTextField(TextFocus.SEARCH, null, rect.x + u(24f), searchFont, rect.width - textReserve);
         renderSelectionHighlight(vg, focused, NVGFonts.INTER, searchFont, rect.x + u(24f), rect.y + u(5f), rect.width - textReserve);
-        NVGFonts.INTER.drawText(visibleText, rect.x + u(24f), rect.y + u(4.5f), searchFont, color, Alignment.LEFT_TOP, false);
+        NVGFonts.INTER.drawText(visibleText, rect.x + u(24f), rect.y + u(4.5f), searchFont, color, Alignment.LEFT_TOP, true);
         renderInlineCaret(vg, focused, NVGFonts.INTER, searchFont, rect.x + u(24f), rect.y + u(4.5f), color);
 
         if (searchQuery.isBlank()) {
@@ -1213,7 +1264,7 @@ public class NanoVGClickGuiScreen extends Screen {
         vg.roundedRectangle(searchClearRect.x, searchClearRect.y, searchClearRect.width, searchClearRect.height, u(4f),
                 clearHovered ? alpha(255, 255, 255, 28) : alpha(255, 255, 255, 10));
         NVGFonts.ICON.drawText(MaterialIcon.CLOSE, searchClearRect.centerX(), searchClearRect.centerY() - u(1f), font(11f),
-                clearHovered ? NanoVGTheme.TEXT : NanoVGTheme.muted(210), Alignment.CENTER_MIDDLE, false);
+                clearHovered ? NanoVGTheme.TEXT : NanoVGTheme.muted(210), Alignment.CENTER_MIDDLE, true);
     }
 
     private void renderFooter(NVGU vg, float x, float y, float width, int visibleCount) {
@@ -1224,45 +1275,75 @@ public class NanoVGClickGuiScreen extends Screen {
             countLabel = visibleCount + (visibleCount == 1 ? " result" : " results");
         else if (configView)
             countLabel = visibleCount + (visibleCount == 1 ? " config" : " configs");
+        else if (commandView && selectedCommandTab == CommandTab.MULTIPLAY)
+            countLabel = visibleCount + (visibleCount == 1 ? " player" : " players");
+        else if (commandView)
+            countLabel = visibleCount + (visibleCount == 1 ? " log" : " logs");
         else
             countLabel = visibleCount + (visibleCount == 1 ? " module" : " modules");
         NVGFonts.INTER.drawText(countLabel, x + width - u(2f), y + u(5f), font(10f),
                 searchQuery.isBlank() ? NanoVGTheme.muted(220) : NanoVGTheme.text(230),
-                Alignment.RIGHT_TOP, false);
+                Alignment.RIGHT_TOP, true);
     }
 
-    private void renderTabs(NVGU vg, float x, float y, float width) {
+    private void renderTabs(NVGU vg, float x, float y, float width, float height) {
         ModuleCategory[] categories = ModuleCategory.values();
-        float gap = u(5f);
-        float tabHeight = u(22f);
+        ConfigTab[] configTabs = ConfigTab.values();
+        CommandTab[] commandTabs = CommandTab.values();
+        int tabCount = categories.length + configTabs.length + commandTabs.length;
+        float naturalHeight = u(5f) + tabCount * u(27f) + u(11f) * 2f;
+        float fit = Math.clamp(height / naturalHeight, 0.72f, 1f);
+        float gap = u(5f) * fit;
+        float tabHeight = u(22f) * fit;
         float tabFont = font(14f);
+        float textOffset = (tabHeight - tabFont) / 2f;
         Rect selectedRect = null;
 
         for (int i = 0; i < categories.length; i++) {
             ModuleCategory category = categories[i];
             Rect rect = new Rect(x, y + u(5f) + i * (tabHeight + gap), width, tabHeight);
-            tabBounds.add(new TabBounds(category, null, rect));
+            tabBounds.add(new TabBounds(category, null, null, rect));
 
-            if (!configView && searchQuery.isBlank() && selectedCategory == category)
+            boolean selected = isModuleView() && searchQuery.isBlank() && selectedCategory == category;
+            if (selected)
                 selectedRect = rect;
 
-            NVGFonts.INTER.drawText(fitText(category.name(), NVGFonts.INTER, tabFont, rect.width - u(20f)), rect.x + u(12f), rect.y + u(4f), tabFont, NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+            NVGFont categoryFont = selected ? NVGFonts.INTER_MEDIUM : NVGFonts.INTER;
+            categoryFont.drawText(fitText(category.name(), categoryFont, tabFont, rect.width - u(20f)), rect.x + u(12f), rect.y + textOffset, tabFont, selected ? NanoVGTheme.TEXT : NanoVGTheme.MUTED, Alignment.LEFT_TOP, true);
         }
 
-        float dividerY = y + u(5f) + categories.length * (tabHeight + gap) + u(2f);
+        float dividerY = y + u(5f) + categories.length * (tabHeight + gap) + u(2f) * fit;
         vg.rectangle(x + u(8f), dividerY, width - u(16f), u(1f), alpha(255, 255, 255, 48));
 
-        ConfigTab[] configTabs = ConfigTab.values();
-        float configStartY = dividerY + u(9f);
+        float configStartY = dividerY + u(9f) * fit;
         for (int i = 0; i < configTabs.length; i++) {
             ConfigTab tab = configTabs[i];
             Rect rect = new Rect(x, configStartY + i * (tabHeight + gap), width, tabHeight);
-            tabBounds.add(new TabBounds(null, tab, rect));
+            tabBounds.add(new TabBounds(null, tab, null, rect));
 
-            if (configView && searchQuery.isBlank() && selectedConfigTab == tab)
+            boolean selected = configView && searchQuery.isBlank() && selectedConfigTab == tab;
+            if (selected)
                 selectedRect = rect;
 
-            NVGFonts.INTER.drawText(fitText(tab.sidebarLabel, NVGFonts.INTER, tabFont, rect.width - u(20f)), rect.x + u(12f), rect.y + u(4f), tabFont, NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+            NVGFont tabLabelFont = selected ? NVGFonts.INTER_MEDIUM : NVGFonts.INTER;
+            tabLabelFont.drawText(fitText(tab.sidebarLabel, tabLabelFont, tabFont, rect.width - u(20f)), rect.x + u(12f), rect.y + textOffset, tabFont, selected ? NanoVGTheme.TEXT : NanoVGTheme.MUTED, Alignment.LEFT_TOP, true);
+        }
+
+        float commandDividerY = configStartY + configTabs.length * (tabHeight + gap) + u(2f) * fit;
+        vg.rectangle(x + u(8f), commandDividerY, width - u(16f), u(1f), alpha(255, 255, 255, 48));
+
+        float commandStartY = commandDividerY + u(9f) * fit;
+        for (int i = 0; i < commandTabs.length; i++) {
+            CommandTab tab = commandTabs[i];
+            Rect rect = new Rect(x, commandStartY + i * (tabHeight + gap), width, tabHeight);
+            tabBounds.add(new TabBounds(null, null, tab, rect));
+
+            boolean selected = commandView && searchQuery.isBlank() && selectedCommandTab == tab;
+            if (selected)
+                selectedRect = rect;
+
+            NVGFont tabLabelFont = selected ? NVGFonts.INTER_MEDIUM : NVGFonts.INTER;
+            tabLabelFont.drawText(fitText(tab.sidebarLabel, tabLabelFont, tabFont, rect.width - u(20f)), rect.x + u(12f), rect.y + textOffset, tabFont, selected ? NanoVGTheme.TEXT : NanoVGTheme.MUTED, Alignment.LEFT_TOP, true);
         }
 
         if (selectedRect == null)
@@ -1360,10 +1441,293 @@ public class NanoVGClickGuiScreen extends Screen {
         return configs.size();
     }
 
+    private int renderCommandList(NVGU vg, float x, float y, float width, float height) {
+        NanoVGTheme.renderCompact(vg, x, y, width, height, u(NanoVGTheme.RADIUS_HUD), 1f, COMPACT_BACKGROUND_ALPHA_OFFSET);
+
+        return selectedCommandTab == CommandTab.MULTIPLAY
+                ? renderMultiplayList(vg, x, y, width, height)
+                : renderCommandConsole(vg, x, y, width, height);
+    }
+
+    private int renderCommandConsole(NVGU vg, float x, float y, float width, float height) {
+        float rowTop = y + u(8f);
+        renderCommandInputRow(vg, x + u(8f), rowTop, width - u(16f));
+        rowTop += u(36f);
+
+        List<String> logs = visibleCommandLogs();
+        listViewport = new Rect(x + u(5f), rowTop, width - u(10f), Math.max(u(42f), y + height - rowTop - u(6f)));
+        float textWidth = Math.max(u(20f), listViewport.width - u(24f));
+        if (Math.abs(commandLogWrapWidth - textWidth) > 0.5f || commandLogLineCache.size() > ModuleRenderable.commandLogs.size() * 2 + 8) {
+            commandLogLineCache.clear();
+            commandLogWrapWidth = textWidth;
+        }
+
+        float contentHeight = u(2f);
+        for (String log : logs)
+            contentHeight += commandLogBlockHeight(log, textWidth);
+        contentHeight = Math.max(ROW_HEIGHT, contentHeight);
+        maxListScroll = Math.max(0f, contentHeight - listViewport.height);
+        if (followNewCommandLogs()) {
+            targetListScroll = maxListScroll;
+            scrollVelocity = 0f;
+        }
+        targetListScroll = Math.clamp(targetListScroll, 0f, maxListScroll);
+        listScroll = Math.clamp(listScroll, 0f, maxListScroll);
+        if (maxListScroll <= 0f)
+            scrollVelocity = 0f;
+
+        withInputClip(listViewport, () -> vg.scissor(listViewport.x, listViewport.y, listViewport.width, listViewport.height, () -> {
+            if (logs.isEmpty()) {
+                renderEmptyState(
+                        vg,
+                        listViewport,
+                        searchQuery.isBlank() ? MaterialIcon.READER : MaterialIcon.SEARCH,
+                        searchQuery.isBlank() ? "Type commands here" : "No matching logs",
+                        searchQuery.isBlank() ? "Run \"help\" to show every command." : "Try another keyword or clear the search."
+                );
+                return;
+            }
+
+            float rowY = listViewport.y - listScroll;
+            float lineHeight = u(15f);
+            float logFont = font(12f);
+            for (String log : logs) {
+                float blockHeight = commandLogBlockHeight(log, textWidth);
+                if (rowY + blockHeight > listViewport.y && rowY < listViewport.y + listViewport.height) {
+                    vg.roundedRectangle(listViewport.x + u(6f), rowY + u(1f), listViewport.width - u(12f), blockHeight - u(3f), u(4f), alpha(255, 255, 255, 12));
+                    List<String> lines = commandLogLines(log, textWidth);
+                    for (int i = 0; i < lines.size(); i++)
+                        NVGFonts.INTER.drawText(lines.get(i), listViewport.x + u(14f), rowY + u(5f) + i * lineHeight, logFont, NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
+                }
+                rowY += blockHeight;
+            }
+        }));
+
+        renderScrollbar(vg, listViewport, contentHeight, listScroll);
+        return logs.size();
+    }
+
+    private void renderCommandInputRow(NVGU vg, float x, float y, float width) {
+        boolean active = textFocus == TextFocus.COMMAND;
+        Rect input = new Rect(x, y, width - u(91f), u(24f));
+        Rect button = new Rect(x + width - u(83f), y, u(83f), u(24f));
+        addControl(ControlType.COMMAND_INPUT, input, null, null, 0);
+        addControl(ControlType.COMMAND_RUN, button, null, null, 0);
+
+        boolean inputHovered = input.contains(scaledMouseX, scaledMouseY);
+        vg.roundedRectangle(input.x, input.y, input.width, input.height, u(5f), alpha(255, 255, 255, active ? 29 : inputHovered ? 22 : 16));
+        vg.roundedRectangleBorder(input.x, input.y, input.width, input.height, u(5f), u(1f), active ? NanoVGTheme.inputFocus(110) : alpha(255, 255, 255, 28), Border.INSIDE);
+
+        String text = inputText(commandInput, active, "Enter a command");
+        float inputFont = font(11f);
+        String visibleText = fitText(text, NVGFonts.INTER, inputFont, input.width - u(32f));
+        Color textColor = commandInput.isBlank() && !active ? NanoVGTheme.muted(180) : NanoVGTheme.TEXT;
+        rememberTextField(TextFocus.COMMAND, null, input.x + u(26f), inputFont, input.width - u(32f));
+        renderSelectionHighlight(vg, active, NVGFonts.INTER, inputFont, input.x + u(26f), input.y + u(6f), input.width - u(32f));
+        NVGFonts.ICON.drawText(MaterialIcon.FORWARD_IOS, input.x + u(8f), input.y + u(5f), font(12f), active ? NanoVGTheme.INPUT_FOCUS : alpha(176, 186, 196, 220), Alignment.LEFT_TOP, true);
+        NVGFonts.INTER.drawText(visibleText, input.x + u(26f), input.y + u(6f), inputFont, textColor, Alignment.LEFT_TOP, true);
+        renderInlineCaret(vg, active, NVGFonts.INTER, inputFont, input.x + u(26f), input.y + u(6f), textColor);
+
+        renderCommandButton(vg, button, "command-run", "Run", !commandInput.isBlank(), false);
+    }
+
+    private int renderMultiplayList(NVGU vg, float x, float y, float width, float height) {
+        float rowTop = y + u(8f);
+        Rect disconnect = new Rect(x + u(8f), rowTop, width - u(16f), u(24f));
+        boolean connected = minecraft != null && minecraft.level != null;
+        addControl(ControlType.MULTIPLAY_DISCONNECT, disconnect, null, null, 0);
+        renderCommandButton(vg, disconnect, "multiplay-disconnect", "Force disconnect from server", connected, true);
+        rowTop += u(36f);
+
+        List<PlayerEntry> players = visibleMultiplayPlayers();
+        listViewport = new Rect(x + u(5f), rowTop, width - u(10f), Math.max(u(42f), y + height - rowTop - u(6f)));
+        float contentHeight = Math.max(ROW_HEIGHT, players.size() * SETTING_ROW_STEP + u(2f));
+        maxListScroll = Math.max(0f, contentHeight - listViewport.height);
+        targetListScroll = Math.clamp(targetListScroll, 0f, maxListScroll);
+        listScroll = Math.clamp(listScroll, 0f, maxListScroll);
+        if (maxListScroll <= 0f)
+            scrollVelocity = 0f;
+
+        withInputClip(listViewport, () -> vg.scissor(listViewport.x, listViewport.y, listViewport.width, listViewport.height, () -> {
+            if (players.isEmpty()) {
+                boolean inWorld = minecraft != null && minecraft.level != null && minecraft.getConnection() != null;
+                renderEmptyState(
+                        vg,
+                        listViewport,
+                        !searchQuery.isBlank() ? MaterialIcon.SEARCH : MaterialIcon.PERSON,
+                        !searchQuery.isBlank() ? "No matching players" : inWorld ? "No players" : "Not connected",
+                        !searchQuery.isBlank() ? "Try another keyword or clear the search." : inWorld ? "No players are loaded nearby." : "Join a world or server to see players."
+                );
+                return;
+            }
+
+            float rowY = listViewport.y - listScroll;
+            for (PlayerEntry player : players) {
+                if (rowY + SETTING_ROW_STEP > listViewport.y && rowY < listViewport.y + listViewport.height)
+                    renderPlayerRow(vg, player, listViewport.x, rowY, listViewport.width);
+                rowY += SETTING_ROW_STEP;
+            }
+        }));
+
+        renderScrollbar(vg, listViewport, contentHeight, listScroll);
+        return players.size();
+    }
+
+    private void renderPlayerRow(NVGU vg, PlayerEntry player, float x, float y, float width) {
+        Rect row = new Rect(x, y, width, SETTING_ROW_STEP - u(4f));
+        if (isHovered(row))
+            renderListRowWash(vg, row, 1f);
+        if (player.self())
+            renderListRowMark(vg, row, 1f);
+
+        float buttonWidth = u(50f);
+        float buttonGap = u(5f);
+        float buttonHeight = u(20f);
+        float buttonY = row.y + (row.height - buttonHeight) / 2f;
+        Rect crash = new Rect(row.x + row.width - u(8f) - buttonWidth, buttonY, buttonWidth, buttonHeight);
+        Rect teleport = new Rect(crash.x - buttonGap - buttonWidth, buttonY, buttonWidth, buttonHeight);
+        Rect kill = new Rect(teleport.x - buttonGap - buttonWidth, buttonY, buttonWidth, buttonHeight);
+        addControl(ControlType.PLAYER_KILL, kill, player.name(), null, 0);
+        addControl(ControlType.PLAYER_TELEPORT, teleport, player.name(), null, 0);
+        addControl(ControlType.PLAYER_CRASH, crash, player.name(), null, 0);
+
+        float nameX = row.x + u(14f);
+        float nameRight = kill.x - u(10f);
+        String pingLabel = player.ping() >= 0 ? player.ping() + "ms" : "-";
+        float pingFont = font(10f);
+        NVGFonts.INTER.drawText(pingLabel, nameRight, row.y + u(8f), pingFont, NanoVGTheme.MUTED, Alignment.RIGHT_TOP, true);
+        nameRight -= NVGFonts.INTER.getWidth(pingLabel, pingFont) + u(8f);
+
+        String name = player.self() ? player.name() + " (You)" : player.name();
+        NVGFont nameFont = player.self() ? NVGFonts.INTER_MEDIUM : NVGFonts.INTER;
+        nameFont.drawText(fitText(name, nameFont, font(14f), Math.max(u(28f), nameRight - nameX)), nameX, row.y + u(7f), font(14f), NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
+
+        String key = "player:" + player.name() + ":";
+        renderCommandButton(vg, kill, key + "kill", "Kill", true, false);
+        renderCommandButton(vg, teleport, key + "tp", "Teleport", true, false);
+        renderCommandButton(vg, crash, key + "crash", "Crash", true, true);
+    }
+
+    private void renderCommandButton(NVGU vg, Rect button, String animationKey, String label, boolean enabled, boolean danger) {
+        boolean hovered = enabled && isHovered(button);
+        float progress = animate("command-button:" + animationKey, hovered, 0.18f);
+        Color fill = !enabled
+                ? alpha(255, 255, 255, 14)
+                : danger
+                ? mix(alpha(255, 255, 255, 18), alpha(255, 74, 74, 52), progress)
+                : alpha(255, 255, 255, (int) (22 + 16 * progress));
+        Color border = !enabled
+                ? alpha(255, 255, 255, 24)
+                : danger
+                ? mix(alpha(255, 255, 255, 28), alpha(255, 96, 96, 110), progress)
+                : NanoVGTheme.inputFocus(88);
+        Color text = !enabled
+                ? NanoVGTheme.muted(180)
+                : danger && progress > 0.01f
+                ? mix(NanoVGTheme.TEXT, alpha(255, 195, 195, 245), progress)
+                : NanoVGTheme.TEXT;
+        float labelFont = font(11f);
+        vg.roundedRectangle(button.x, button.y, button.width, button.height, u(5f), fill);
+        vg.roundedRectangleBorder(button.x, button.y, button.width, button.height, u(5f), u(1f), border, Border.INSIDE);
+        NVGFonts.INTER.drawText(fitText(label, NVGFonts.INTER, labelFont, button.width - u(8f)), button.centerX(), button.centerY() - labelFont / 2f, labelFont, text, Alignment.CENTER_TOP, true);
+    }
+
+    private List<String> visibleCommandLogs() {
+        String query = normalize(searchQuery);
+        List<String> logs = new ArrayList<>();
+        for (String log : ModuleRenderable.commandLogs) {
+            if (log != null && (query.isBlank() || normalize(log).contains(query)))
+                logs.add(log);
+        }
+        return logs;
+    }
+
+    private List<String> commandLogLines(String log, float textWidth) {
+        return commandLogLineCache.computeIfAbsent(log, ignored -> wrapTextToWidth(log, NVGFonts.INTER, font(12f), textWidth));
+    }
+
+    private float commandLogBlockHeight(String log, float textWidth) {
+        return commandLogLines(log, textWidth).size() * u(15f) + u(12f);
+    }
+
+    private boolean followNewCommandLogs() {
+        List<String> logs = ModuleRenderable.commandLogs;
+        int count = logs.size();
+        String last = count > 0 ? logs.get(count - 1) : null;
+        boolean changed = count != lastSeenCommandLogCount || last != lastSeenCommandLog;
+        lastSeenCommandLogCount = count;
+        lastSeenCommandLog = last;
+        return changed;
+    }
+
+    private List<PlayerEntry> visibleMultiplayPlayers() {
+        List<PlayerEntry> players = new ArrayList<>();
+        if (minecraft == null || minecraft.level == null || minecraft.getConnection() == null)
+            return players;
+
+        String query = normalize(searchQuery);
+        for (AbstractClientPlayer player : minecraft.level.players()) {
+            String name = player.getName().getString();
+            if (!query.isBlank() && !normalize(name).contains(query))
+                continue;
+
+            PlayerInfo info = minecraft.getConnection().getPlayerInfo(player.getUUID());
+            players.add(new PlayerEntry(name, info != null ? info.getLatency() : -1, player instanceof LocalPlayer));
+        }
+
+        players.sort(Comparator.comparing(PlayerEntry::name, String.CASE_INSENSITIVE_ORDER));
+        return players;
+    }
+
+    private void runCommandInput() {
+        String command = commandInput.trim();
+        if (command.isEmpty())
+            return;
+
+        if (commandHistory.isEmpty() || !commandHistory.get(commandHistory.size() - 1).equals(command)) {
+            commandHistory.add(command);
+            while (commandHistory.size() > MAX_COMMAND_HISTORY)
+                commandHistory.remove(0);
+        }
+        commandHistoryIndex = -1;
+        commandInput = "";
+        textCaret = 0;
+        textAnchor = 0;
+        ModuleRenderable.executeCommand(command, false);
+    }
+
+    private void browseCommandHistory(int direction) {
+        if (commandHistory.isEmpty())
+            return;
+
+        int index = commandHistoryIndex < 0 ? commandHistory.size() : commandHistoryIndex;
+        index += direction;
+        if (index >= commandHistory.size()) {
+            commandHistoryIndex = -1;
+            commandInput = "";
+        } else {
+            commandHistoryIndex = Math.max(0, index);
+            commandInput = commandHistory.get(commandHistoryIndex);
+        }
+        textCaret = commandInput.length();
+        textAnchor = textCaret;
+    }
+
+    private void sendPlayerCommand(String command) {
+        if (minecraft != null && minecraft.getConnection() != null)
+            minecraft.getConnection().sendCommand(command);
+    }
+
+    private void resetCommandScroll() {
+        resetListScroll();
+        lastSeenCommandLogCount = -1;
+        lastSeenCommandLog = null;
+    }
+
     private static void renderEmptyState(NVGU vg, Rect viewport, String icon, String title, String detail) {
         float centerX = viewport.centerX();
         float centerY = viewport.centerY() - u(7f);
-        NVGFonts.ICON.drawText(icon, centerX, centerY - u(20f), font(16f), NanoVGTheme.muted(200), Alignment.CENTER_MIDDLE, false);
+        NVGFonts.ICON.drawText(icon, centerX, centerY - u(20f), font(16f), NanoVGTheme.muted(200), Alignment.CENTER_MIDDLE, true);
         NVGFonts.INTER.drawText(
                 fitText(title, NVGFonts.INTER, font(14f), Math.max(u(40f), viewport.width - u(32f))),
                 centerX,
@@ -1371,7 +1735,7 @@ public class NanoVGClickGuiScreen extends Screen {
                 font(14f),
                 NanoVGTheme.TEXT,
                 Alignment.CENTER_TOP,
-                false
+                true
         );
         NVGFonts.INTER.drawText(
                 fitText(detail, NVGFonts.INTER, font(11f), Math.max(u(40f), viewport.width - u(32f))),
@@ -1380,7 +1744,7 @@ public class NanoVGClickGuiScreen extends Screen {
                 font(11f),
                 NanoVGTheme.MUTED,
                 Alignment.CENTER_TOP,
-                false
+                true
         );
     }
 
@@ -1402,8 +1766,8 @@ public class NanoVGClickGuiScreen extends Screen {
         Color nameColor = newConfigName.isBlank() && !active ? NanoVGTheme.muted(180) : NanoVGTheme.TEXT;
         rememberTextField(TextFocus.CONFIG_NAME, null, input.x + u(26f), createFont, input.width - u(32f));
         renderSelectionHighlight(vg, active, NVGFonts.INTER, createFont, input.x + u(26f), input.y + u(6f), input.width - u(32f));
-        NVGFonts.ICON.drawText(MaterialIcon.ADD, input.x + u(8f), input.y + u(5f), font(12f), active ? NanoVGTheme.INPUT_FOCUS : alpha(176, 186, 196, 220), Alignment.LEFT_TOP, false);
-        NVGFonts.INTER.drawText(visibleText, input.x + u(26f), input.y + u(6f), createFont, nameColor, Alignment.LEFT_TOP, false);
+        NVGFonts.ICON.drawText(MaterialIcon.ADD, input.x + u(8f), input.y + u(5f), font(12f), active ? NanoVGTheme.INPUT_FOCUS : alpha(176, 186, 196, 220), Alignment.LEFT_TOP, true);
+        NVGFonts.INTER.drawText(visibleText, input.x + u(26f), input.y + u(6f), createFont, nameColor, Alignment.LEFT_TOP, true);
         renderInlineCaret(vg, active, NVGFonts.INTER, createFont, input.x + u(26f), input.y + u(6f), nameColor);
 
         boolean canCreate = !cleanConfigName(newConfigName).isBlank();
@@ -1411,7 +1775,7 @@ public class NanoVGClickGuiScreen extends Screen {
         float progress = animate("config-create", canCreate && hovered, 0.18f);
         vg.roundedRectangle(button.x, button.y, button.width, button.height, u(5f), alpha(255, 255, 255, canCreate ? (int) (22 + 16 * progress) : 14));
         vg.roundedRectangleBorder(button.x, button.y, button.width, button.height, u(5f), u(1f), canCreate ? NanoVGTheme.inputFocus(88) : alpha(255, 255, 255, 24), Border.INSIDE);
-        NVGFonts.INTER.drawText("Create", button.centerX(), button.y + u(6f), font(11f), canCreate ? NanoVGTheme.TEXT : NanoVGTheme.muted(180), Alignment.CENTER_TOP, false);
+        NVGFonts.INTER.drawText("Create", button.centerX(), button.y + u(6f), font(11f), canCreate ? NanoVGTheme.TEXT : NanoVGTheme.muted(180), Alignment.CENTER_TOP, true);
     }
 
     private void renderConfigRow(NVGU vg, ConfigEntry config, int index, int visibleCount, float x, float y, float width) {
@@ -1438,14 +1802,16 @@ public class NanoVGClickGuiScreen extends Screen {
         if (!updatedLabel.isBlank()) {
             float updatedFont = font(10f);
             float updatedWidth = NVGFonts.INTER.getWidth(updatedLabel, updatedFont);
-            NVGFonts.INTER.drawText(updatedLabel, nameRight, row.y + u(8f), updatedFont, NanoVGTheme.MUTED, Alignment.RIGHT_TOP, false);
+            NVGFonts.INTER.drawText(updatedLabel, nameRight, row.y + u(8f), updatedFont, NanoVGTheme.MUTED, Alignment.RIGHT_TOP, true);
             nameRight -= updatedWidth + u(8f);
         }
         float nameWidth = Math.max(u(28f), nameRight - nameX);
         if (renaming)
             renderConfigRenameField(vg, config, nameX, row.y, nameWidth, row.height);
-        else
-            NVGFonts.INTER.drawText(fitText(config.name, NVGFonts.INTER, font(14f), nameWidth), nameX, row.y + u(7f), font(14f), NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+        else {
+            NVGFont nameFont = config.current ? NVGFonts.INTER_MEDIUM : NVGFonts.INTER;
+            nameFont.drawText(fitText(config.name, nameFont, font(14f), nameWidth), nameX, row.y + u(7f), font(14f), NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
+        }
 
         if (delete != null) {
             boolean deleteHovered = deletable && isHovered(delete);
@@ -1453,7 +1819,7 @@ public class NanoVGClickGuiScreen extends Screen {
             vg.roundedRectangle(delete.x, delete.y, delete.width, delete.height, u(5f), deletable ? mix(alpha(255, 255, 255, 12), alpha(255, 74, 74, 52), deleteProgress) : alpha(255, 255, 255, 8));
             vg.roundedRectangleBorder(delete.x, delete.y, delete.width, delete.height, u(5f), u(1f), deletable ? mix(alpha(255, 255, 255, 24), alpha(255, 96, 96, 110), deleteProgress) : alpha(255, 255, 255, 16), Border.INSIDE);
             Color deleteColor = !deletable ? alpha(120, 130, 140, 135) : deleteHovered ? alpha(255, 195, 195, 245) : alpha(176, 186, 196, 220);
-            NVGFonts.ICON.drawText(MaterialIcon.DELETE, delete.centerX(), delete.centerY() - u(1f), font(12f), deleteColor, Alignment.CENTER_MIDDLE, false);
+            NVGFonts.ICON.drawText(MaterialIcon.DELETE, delete.centerX(), delete.centerY() - u(1f), font(12f), deleteColor, Alignment.CENTER_MIDDLE, true);
         }
     }
 
@@ -1470,7 +1836,7 @@ public class NanoVGClickGuiScreen extends Screen {
         rememberTextField(TextFocus.CONFIG_RENAME, config, textX, renameFont, textMaxWidth);
         vg.scissor(input.x, input.y, input.width, input.height, () -> {
             renderSelectionHighlight(vg, true, NVGFonts.INTER, renameFont, textX, textY, textMaxWidth);
-            NVGFonts.INTER.drawText(text, textX, textY, renameFont, NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+            NVGFonts.INTER.drawText(text, textX, textY, renameFont, NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
             renderInlineCaret(vg, true, NVGFonts.INTER, renameFont, textX, textY, NanoVGTheme.TEXT);
         });
     }
@@ -1499,12 +1865,13 @@ public class NanoVGClickGuiScreen extends Screen {
         if (!bindLabel.isBlank()) {
             float bindFont = font(10f);
             float bindWidth = NVGFonts.INTER.getWidth(bindLabel, bindFont);
-            NVGFonts.INTER.drawText(bindLabel, nameRight, row.y + u(8f), bindFont, NanoVGTheme.MUTED, Alignment.RIGHT_TOP, false);
+            NVGFonts.INTER.drawText(bindLabel, nameRight, row.y + u(8f), bindFont, NanoVGTheme.MUTED, Alignment.RIGHT_TOP, true);
             nameRight -= bindWidth + u(8f);
         }
 
         float nameMaxWidth = Math.max(u(36f), nameRight - nameX);
-        NVGFonts.INTER.drawText(fitText(module.moduleName, NVGFonts.INTER, font(14f), nameMaxWidth), nameX, row.y + u(7f), font(14f), NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+        NVGFont nameFont = selected ? NVGFonts.INTER_MEDIUM : NVGFonts.INTER;
+        nameFont.drawText(fitText(module.moduleName, nameFont, font(14f), nameMaxWidth), nameX, row.y + u(7f), font(14f), NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
 
         drawSwitch(vg, switchRect.x, switchRect.y, switchRect.width, switchRect.height, enabled, "module-list:" + System.identityHashCode(module), pressedModule == module);
     }
@@ -1515,7 +1882,7 @@ public class NanoVGClickGuiScreen extends Screen {
         List<SettingValue<?>> settings = collectSettings(module);
 
         if (!hasRenderableSettings(module)) {
-            NVGFonts.INTER.drawText("No settings", x + u(10f), rowY + u(7f), font(12f), NanoVGTheme.MUTED, Alignment.LEFT_TOP, false);
+            NVGFonts.INTER.drawText("No settings", x + u(10f), rowY + u(7f), font(12f), NanoVGTheme.MUTED, Alignment.LEFT_TOP, true);
             return;
         }
 
@@ -1543,14 +1910,14 @@ public class NanoVGClickGuiScreen extends Screen {
         String updated = formatConfigUpdatedAt(config);
         Rect row = new Rect(rowX, y + u(2f), rowWidth, configUpdatedCardHeight(rowWidth, updated));
         vg.roundedRectangle(row.x, row.y + u(1f), row.width, row.height - u(2f), u(4f), alpha(255, 255, 255, 14));
-        NVGFonts.INTER.drawText("Last Updated", row.x + u(12f), row.y + u(6f), font(12f), NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+        NVGFonts.INTER.drawText("Last Updated", row.x + u(12f), row.y + u(6f), font(12f), NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
 
         List<String> lines = wrapConfigUpdatedLines(updated, rowWidth);
         float textY = row.y + u(24f);
         float lineHeight = u(15f);
         float valueFont = font(11f);
         for (int i = 0; i < lines.size(); i++) {
-            NVGFonts.INTER.drawText(lines.get(i), row.x + u(12f), textY + i * lineHeight, valueFont, NanoVGTheme.MUTED, Alignment.LEFT_TOP, false);
+            NVGFonts.INTER.drawText(lines.get(i), row.x + u(12f), textY + i * lineHeight, valueFont, NanoVGTheme.MUTED, Alignment.LEFT_TOP, true);
         }
     }
 
@@ -1643,7 +2010,7 @@ public class NanoVGClickGuiScreen extends Screen {
         float noteFont = font(12f);
         float noteLine = u(15f);
         for (int i = 0; i < lines.size(); i++) {
-            NVGFonts.INTER.drawText(lines.get(i), row.x + u(12f), textY + i * noteLine, noteFont, NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+            NVGFonts.INTER.drawText(lines.get(i), row.x + u(12f), textY + i * noteLine, noteFont, NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
         }
         return y + height + u(7f);
     }
@@ -1682,15 +2049,15 @@ public class NanoVGClickGuiScreen extends Screen {
     private void renderSettingRow(NVGU vg, Rect row, String label, String value, float enabled) {
         if (enabled > 0.01f)
             renderListRowWash(vg, row, enabled);
-        NVGFonts.INTER.drawText(fitText(label, NVGFonts.INTER, font(12f), row.width * 0.50f), row.x + u(12f), row.y + u(7f), font(12f), NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+        NVGFonts.INTER.drawText(fitText(label, NVGFonts.INTER, font(12f), row.width * 0.50f), row.x + u(12f), row.y + u(7f), font(12f), NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
         if (value != null)
-            NVGFonts.INTER.drawText(fitText(value, NVGFonts.INTER, font(11f), row.width * 0.36f), row.x + row.width - u(25f), row.y + u(8f), font(11f), NanoVGTheme.MUTED, Alignment.RIGHT_TOP, false);
+            NVGFonts.INTER.drawText(fitText(value, NVGFonts.INTER, font(11f), row.width * 0.36f), row.x + row.width - u(25f), row.y + u(8f), font(11f), NanoVGTheme.MUTED, Alignment.RIGHT_TOP, true);
     }
 
     private void renderKeybindRow(NVGU vg, Rect row, String label, String value) {
-        NVGFonts.INTER.drawText(fitText(label, NVGFonts.INTER, font(12f), row.width * 0.50f), row.x + u(12f), row.y + u(7f), font(12f), NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+        NVGFonts.INTER.drawText(fitText(label, NVGFonts.INTER, font(12f), row.width * 0.50f), row.x + u(12f), row.y + u(7f), font(12f), NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
         if (value != null)
-            NVGFonts.INTER.drawText(value, row.x + row.width - u(25f), row.y + u(8f), font(11f), NanoVGTheme.MUTED, Alignment.RIGHT_TOP, false);
+            NVGFonts.INTER.drawText(value, row.x + row.width - u(25f), row.y + u(8f), font(11f), NanoVGTheme.MUTED, Alignment.RIGHT_TOP, true);
     }
 
     private void renderListSetting(NVGU vg, Rect row, Module module, ListValue value) {
@@ -1709,7 +2076,7 @@ public class NanoVGClickGuiScreen extends Screen {
 
         drawWrappedSettingLabel(value.name, row.x + u(12f), row.y + u(7f), listLabelMaxWidth(row.width));
         if (dropdownProgress <= 0.01f && value.get() != null)
-            NVGFonts.INTER.drawText(fitText(value.get(), NVGFonts.INTER, font(11f), row.width * 0.36f), row.x + row.width - u(25f), row.y + u(8f), font(11f), NanoVGTheme.MUTED, Alignment.RIGHT_TOP, false);
+            NVGFonts.INTER.drawText(fitText(value.get(), NVGFonts.INTER, font(11f), row.width * 0.36f), row.x + row.width - u(25f), row.y + u(8f), font(11f), NanoVGTheme.MUTED, Alignment.RIGHT_TOP, true);
         if (dropdownProgress <= 0.01f) {
             addControl(ControlType.LIST_VALUE, row, value, module, 0);
             return;
@@ -1731,7 +2098,7 @@ public class NanoVGClickGuiScreen extends Screen {
 
             float optionY = y;
             for (int i = 0; i < value.values.length; i++) {
-                float optionProgress = Math.clamp((progress - i * 0.035f) / 0.78f, 0f, 1f);
+                float optionProgress = Math.clamp((progress - i * listOptionStagger(value)) / 0.78f, 0f, 1f);
                 if (optionProgress > 0.01f)
                     addControl(ControlType.LIST_OPTION, new Rect(x, optionY, width, heights[i]), value, null, i);
                 optionY += heights[i];
@@ -1743,7 +2110,7 @@ public class NanoVGClickGuiScreen extends Screen {
             for (int i = 0; i < value.values.length; i++) {
                 String option = value.values[i];
                 float optionHeight = heights[i];
-                float optionProgress = Math.clamp((progress - i * 0.035f) / 0.78f, 0f, 1f);
+                float optionProgress = Math.clamp((progress - i * listOptionStagger(value)) / 0.78f, 0f, 1f);
                 if (optionProgress > 0.01f) {
                     Rect optionRect = new Rect(x, optionY, width, optionHeight);
                     boolean selected = i == value.getCurrentIndex();
@@ -1754,12 +2121,16 @@ public class NanoVGClickGuiScreen extends Screen {
                     vg.globalAlpha(finalOptionProgress, () -> {
                         if (selected)
                             renderListRowMark(vg, optionChip);
-                        drawWrappedListOption(option, optionChip.x + u(12f), optionChip.y + u(4f) + textOffset, optionChip.width - u(18f));
+                        drawWrappedListOption(option, optionChip.x + u(12f), optionChip.y + u(4f) + textOffset, optionChip.width - u(18f), selected);
                     });
                 }
                 optionY += optionHeight;
             }
         }));
+    }
+
+    private static float listOptionStagger(ListValue value) {
+        return Math.min(0.035f, 0.22f / Math.max(1, value.values.length));
     }
 
     private void renderFloatSetting(NVGU vg, Rect row, FloatValue value) {
@@ -1813,12 +2184,12 @@ public class NanoVGClickGuiScreen extends Screen {
                 numberFont,
                 numberColor,
                 Alignment.LEFT_TOP,
-                false
+                true
         );
         renderInlineCaret(vg, true, NVGFonts.INTER, numberFont, input.x + u(6f), input.y + u(5f), numberColor);
         if (!shownSuffix.isEmpty())
             NVGFonts.INTER.drawText(shownSuffix, input.x + input.width - u(6f), input.y + u(5f), font(9f),
-                    alpha(150, 160, 170, 220), Alignment.RIGHT_TOP, false);
+                    alpha(150, 160, 170, 220), Alignment.RIGHT_TOP, true);
     }
 
     private void renderColorSetting(NVGU vg, Rect row, ColorValue value) {
@@ -1863,7 +2234,7 @@ public class NanoVGClickGuiScreen extends Screen {
         rememberTextField(TextFocus.SETTING, value, input.x + u(6f), settingFont, input.width - u(10f));
         renderSelectionHighlight(vg, active, NVGFonts.INTER, settingFont, input.x + u(6f), input.y + u(5f), input.width - u(10f));
         Color textColor = value.get().isEmpty() && !active ? alpha(120, 130, 140, 205) : alpha(255, 255, 255, 235);
-        NVGFonts.INTER.drawText(visibleText, input.x + u(6f), input.y + u(5f), settingFont, textColor, Alignment.LEFT_TOP, false);
+        NVGFonts.INTER.drawText(visibleText, input.x + u(6f), input.y + u(5f), settingFont, textColor, Alignment.LEFT_TOP, true);
         renderInlineCaret(vg, active, NVGFonts.INTER, settingFont, input.x + u(6f), input.y + u(5f), textColor);
     }
 
@@ -1999,6 +2370,18 @@ public class NanoVGClickGuiScreen extends Screen {
                 beginTextSelectionOrSelectAll(mouseX, doubleClick);
             }
             case CONFIG_CREATE -> createConfigFromInput();
+            case COMMAND_INPUT -> {
+                textFocus = TextFocus.COMMAND;
+                beginTextSelectionOrSelectAll(mouseX, doubleClick);
+            }
+            case COMMAND_RUN -> runCommandInput();
+            case MULTIPLAY_DISCONNECT -> {
+                if (minecraft != null && minecraft.level != null)
+                    minecraft.level.disconnect(Component.literal("Disconnected"));
+            }
+            case PLAYER_KILL -> sendPlayerCommand("kill " + control.target);
+            case PLAYER_TELEPORT -> sendPlayerCommand("tp " + control.target);
+            case PLAYER_CRASH -> sendPlayerCommand("execute at " + control.target + " run particle minecraft:explosion ~ ~ ~ 0.1 0.1 0.1 0.01 100000000 force");
             case CONFIG_LOAD -> loadConfigEntry((ConfigEntry) control.target);
             case CONFIG_RENAME -> {
             }
@@ -2784,6 +3167,10 @@ public class NanoVGClickGuiScreen extends Screen {
         activeSettingsPanelScrollbar = null;
     }
 
+    private boolean isModuleView() {
+        return !configView && !commandView;
+    }
+
     private boolean isSettingsDockOpen() {
         return settingsPanelModule != null || settingsPanelConfig != null;
     }
@@ -2876,7 +3263,7 @@ public class NanoVGClickGuiScreen extends Screen {
         searchQuery = "";
         textCaret = 0;
         textAnchor = 0;
-        if (!configView && selectedCategory != null)
+        if (isModuleView() && selectedCategory != null)
             restoreCategoryScroll(selectedCategory);
         else
             resetListScroll();
@@ -2952,7 +3339,7 @@ public class NanoVGClickGuiScreen extends Screen {
 
         vg.globalAlpha(easeOut(progress), () -> {
             NanoVGTheme.renderPanel(vg, drawX, drawY, width, height, u(NanoVGTheme.RADIUS_HUD), 1f);
-            NVGFonts.INTER.drawText(text, drawX + paddingX, drawY + u(6f), tooltipFont, NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+            NVGFonts.INTER.drawText(text, drawX + paddingX, drawY + u(6f), tooltipFont, NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
         });
     }
 
@@ -3023,21 +3410,32 @@ public class NanoVGClickGuiScreen extends Screen {
         storeCurrentCategoryScroll();
         ModuleCategory[] categories = ModuleCategory.values();
         ConfigTab[] configTabs = ConfigTab.values();
+        CommandTab[] commandTabs = CommandTab.values();
         int categoryCount = categories.length;
-        int total = categoryCount + configTabs.length;
+        int configEnd = categoryCount + configTabs.length;
+        int total = configEnd + commandTabs.length;
         int current = configView
                 ? categoryCount + selectedConfigTab.ordinal()
+                : commandView
+                ? configEnd + selectedCommandTab.ordinal()
                 : selectedCategory.ordinal();
         int next = Math.floorMod(current + delta, total);
         searchQuery = "";
         if (next < categoryCount) {
             configView = false;
+            commandView = false;
             selectedCategory = categories[next];
             restoreCategoryScroll(selectedCategory);
-        } else {
+        } else if (next < configEnd) {
             configView = true;
+            commandView = false;
             selectedConfigTab = configTabs[next - categoryCount];
             resetListScroll();
+        } else {
+            configView = false;
+            commandView = true;
+            selectedCommandTab = commandTabs[next - configEnd];
+            resetCommandScroll();
         }
         clearInteractionState();
     }
@@ -3158,6 +3556,7 @@ public class NanoVGClickGuiScreen extends Screen {
     private String getFocusedText() {
         if (textFocus == TextFocus.SEARCH) return searchQuery;
         if (textFocus == TextFocus.CONFIG_NAME) return newConfigName;
+        if (textFocus == TextFocus.COMMAND) return commandInput;
         if (textFocus == TextFocus.CONFIG_RENAME) return renameConfigName;
         if (textFocus == TextFocus.SETTING && focusedTextValue != null) return focusedTextValue.get();
         if (textFocus == TextFocus.NUMBER) return numberInput;
@@ -3167,7 +3566,7 @@ public class NanoVGClickGuiScreen extends Screen {
     private void setFocusedText(String text) {
         if (textFocus == TextFocus.SEARCH) {
             searchQuery = text == null ? "" : text;
-            if (searchQuery.isBlank() && !configView && selectedCategory != null)
+            if (searchQuery.isBlank() && isModuleView() && selectedCategory != null)
                 restoreCategoryScroll(selectedCategory);
             else
                 resetListScroll();
@@ -3176,6 +3575,15 @@ public class NanoVGClickGuiScreen extends Screen {
 
         if (textFocus == TextFocus.CONFIG_NAME) {
             newConfigName = text == null ? "" : text;
+            return;
+        }
+
+        if (textFocus == TextFocus.COMMAND) {
+            String next = text == null ? "" : text;
+            if (next.length() > MAX_COMMAND_INPUT_LENGTH)
+                next = next.substring(0, MAX_COMMAND_INPUT_LENGTH);
+            commandInput = next;
+            commandHistoryIndex = -1;
             return;
         }
 
@@ -3418,7 +3826,7 @@ public class NanoVGClickGuiScreen extends Screen {
 
     private CursorType cursorForControl(ControlBounds control) {
         return switch (control.type) {
-            case TEXT_VALUE, CONFIG_NAME, CONFIG_RENAME -> CursorTypes.IBEAM;
+            case TEXT_VALUE, CONFIG_NAME, CONFIG_RENAME, COMMAND_INPUT -> CursorTypes.IBEAM;
             case FLOAT_SLIDER, INT_SLIDER, COLOR_SLIDER -> CursorTypes.POINTING_HAND;
             case FLOAT_INPUT, INT_INPUT ->
                     textFocus == TextFocus.NUMBER && focusedNumberValue == control.target
@@ -3525,7 +3933,7 @@ public class NanoVGClickGuiScreen extends Screen {
             return;
 
         float caretX = textX + font.getWidth(text.substring(0, caret), fontSize);
-        font.drawText("|", caretX, textY, fontSize, color, Alignment.CENTER_TOP, false);
+        font.drawText("|", caretX, textY, fontSize, color, Alignment.CENTER_TOP, true);
     }
 
     private void renderSelectionHighlight(
@@ -3627,16 +4035,17 @@ public class NanoVGClickGuiScreen extends Screen {
         return Math.max(u(20f), u(4f) + lines * u(14f) + u(3f));
     }
 
-    private void drawWrappedListOption(String option, float x, float y, float maxWidth) {
+    private void drawWrappedListOption(String option, float x, float y, float maxWidth, boolean selected) {
         float size = font(11f);
         float lineHeight = u(14f);
+        NVGFont optionFont = selected ? NVGFonts.INTER_MEDIUM : NVGFonts.INTER;
         List<String> lines = wrapListOption(option, maxWidth);
         for (int i = 0; i < lines.size(); i++)
-            NVGFonts.INTER.drawText(lines.get(i), x, y + i * lineHeight, size, NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+            optionFont.drawText(lines.get(i), x, y + i * lineHeight, size, NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
     }
 
     private static List<String> wrapListOption(String option, float maxWidth) {
-        return wrapTextToWidth(option == null ? "" : option, NVGFonts.INTER, font(11f), Math.max(u(20f), maxWidth));
+        return wrapTextToWidth(option == null ? "" : option, NVGFonts.INTER_MEDIUM, font(11f), Math.max(u(20f), maxWidth));
     }
 
     private float wrappedSettingRowHeight(String label, float maxWidth) {
@@ -3649,7 +4058,7 @@ public class NanoVGClickGuiScreen extends Screen {
         float lineHeight = u(15f);
         List<String> lines = wrapSettingLabel(label, maxWidth);
         for (int i = 0; i < lines.size(); i++)
-            NVGFonts.INTER.drawText(lines.get(i), x, y + i * lineHeight, size, NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+            NVGFonts.INTER.drawText(lines.get(i), x, y + i * lineHeight, size, NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
     }
 
     private static List<String> wrapSettingLabel(String label, float maxWidth) {
@@ -3797,13 +4206,25 @@ public class NanoVGClickGuiScreen extends Screen {
         }
     }
 
+    private enum CommandTab {
+        COMMAND("Command"),
+        MULTIPLAY("Multiplay");
+
+        private final String sidebarLabel;
+
+        CommandTab(String sidebarLabel) {
+            this.sidebarLabel = sidebarLabel;
+        }
+    }
+
     private enum TextFocus {
         NONE,
         SEARCH,
         SETTING,
         NUMBER,
         CONFIG_NAME,
-        CONFIG_RENAME
+        CONFIG_RENAME,
+        COMMAND
     }
 
     private enum ControlType {
@@ -3812,6 +4233,12 @@ public class NanoVGClickGuiScreen extends Screen {
         CONFIG_LOAD,
         CONFIG_RENAME,
         CONFIG_DELETE,
+        COMMAND_INPUT,
+        COMMAND_RUN,
+        MULTIPLAY_DISCONNECT,
+        PLAYER_KILL,
+        PLAYER_TELEPORT,
+        PLAYER_CRASH,
         SHOW_ON_ARRAY,
         MODULE_ENABLED,
         MODULE_KEY,
@@ -3827,10 +4254,17 @@ public class NanoVGClickGuiScreen extends Screen {
         KEY_VALUE
     }
 
-    private record TabBounds(ModuleCategory category, ConfigTab configTab, Rect rect) {
+    private record TabBounds(ModuleCategory category, ConfigTab configTab, CommandTab commandTab, Rect rect) {
         private boolean isConfig() {
             return configTab != null;
         }
+
+        private boolean isCommand() {
+            return commandTab != null;
+        }
+    }
+
+    private record PlayerEntry(String name, int ping, boolean self) {
     }
 
     private record ModuleRowBounds(Module module, Rect rect) {

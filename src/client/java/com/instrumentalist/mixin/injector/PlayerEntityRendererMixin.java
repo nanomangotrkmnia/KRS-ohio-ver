@@ -3,7 +3,7 @@ package com.instrumentalist.mixin.injector;
 import com.instrumentalist.krs.utils.IMinecraft;
 import com.instrumentalist.krs.Client;
 import com.instrumentalist.krs.hacks.ModuleManager;
-import com.instrumentalist.krs.hacks.features.render.ClientCape;
+import com.instrumentalist.krs.hacks.features.render.Capes;
 import com.instrumentalist.krs.hacks.features.render.OldHitting;
 import com.instrumentalist.krs.hacks.features.render.Rotations;
 import com.instrumentalist.krs.utils.entity.PlayerUtil;
@@ -32,7 +32,7 @@ public abstract class PlayerEntityRendererMixin implements IMinecraft {
 
     @Inject(method = "extractCapeState", at = @At("HEAD"), cancellable = true)
     private static void capeModifier(Avatar avatar, AvatarRenderState state, float tickDelta, CallbackInfo ci) {
-        if (avatar instanceof LocalPlayer player && ModuleManager.getModuleState(ClientCape.class) && ClientCape.oldCapeMovement.get()) {
+        if (avatar instanceof LocalPlayer player && ModuleManager.getModuleState(Capes.class) && Capes.oldCapeMovement.get()) {
             ci.cancel();
 
             ClientAvatarState avatarState = player.avatarState();
@@ -78,10 +78,11 @@ public abstract class PlayerEntityRendererMixin implements IMinecraft {
                 || avatar != mc.player
                 || Client.rotationManager == null
                 || !Client.rotationManager.isRotating()
-                || !ModuleManager.getModuleState(Rotations.class))
+                || !ModuleManager.getModuleState(Rotations.class)
+                || !Rotations.capeFix.get())
             return fallback;
 
-        if (Rotations.vanilla.get())
+        if (Rotations.realistic.get())
             return Client.rotationManager.getInterpolatedBodyYaw(tickDelta);
 
         if (Client.rotationManager.isReturning())
@@ -101,7 +102,7 @@ public abstract class PlayerEntityRendererMixin implements IMinecraft {
         applyEmptyHandSpoofArmPose(state);
         applyOldHittingUseState(state);
 
-        if (Client.rotationManager.isRotating() && ModuleManager.getModuleState(Rotations.class) && !Rotations.vanilla.get()) {
+        if (Client.rotationManager.isRotating() && ModuleManager.getModuleState(Rotations.class) && !Rotations.realistic.get()) {
             float headYaw = Client.rotationManager.getInterpolatedYaw(f);
             if (Client.rotationManager.isReturning()) {
                 float bodyYaw = Client.rotationManager.getInterpolatedReturningBodyYaw(f);

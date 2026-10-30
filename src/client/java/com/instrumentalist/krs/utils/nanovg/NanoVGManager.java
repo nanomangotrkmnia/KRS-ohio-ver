@@ -2,6 +2,7 @@ package com.instrumentalist.krs.utils.nanovg;
 
 import com.instrumentalist.krs.utils.IMinecraft;
 import com.instrumentalist.krs.utils.render.GraphicsApiCompatibility;
+import com.instrumentalist.krs.utils.render.Shader2DRenderer;
 import com.mojang.logging.LogUtils;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.opengl.GL13;
@@ -36,10 +37,10 @@ public class NanoVGManager implements IMinecraft {
     private final Consumer<NVGU> queuedRenderConsumer = this::renderFrameQueue;
     private final Consumer<NVGU> beforeGuiQueuedRenderConsumer = this::renderBeforeGuiFrameQueue;
     private final Map<Class<?>, Long> rendererFailureLogTimes = new HashMap<>();
-    private final int[] viewport = new int[4];
     private final ByteBuffer colourWriteMask = BufferUtils.createByteBuffer(4);
     private long lastQueueOverflowLogNanos;
     private int droppedRenderers;
+    private boolean worldAnchoredQueued;
 
     public static float getUiScale() {
         int guiScale = mc.getWindow().getGuiScale();
@@ -93,6 +94,27 @@ public class NanoVGManager implements IMinecraft {
         }
     }
 
+    /**
+     * Queues a renderer whose positions are projected from the world this
+     * frame (name tags, indicators). On non-OpenGL backends such frames are
+     * composited synchronously so they cannot trail the camera.
+     */
+    public void loadWorldAnchored(Consumer<NVGU> vg) {
+        if (vg == null)
+            return;
+
+        synchronized (renderQueueLock) {
+            worldAnchoredQueued = true;
+        }
+        load(vg);
+    }
+
+    public boolean hasWorldAnchoredRenderers() {
+        synchronized (renderQueueLock) {
+            return worldAnchoredQueued;
+        }
+    }
+
     public void loadBeforeGui(Consumer<NVGU> vg) {
         if (vg == null)
             return;
@@ -120,6 +142,7 @@ public class NanoVGManager implements IMinecraft {
             renderQueue = frameRenderQueue;
             frameRenderQueue = pendingRenderers;
             renderQueue.clear();
+            worldAnchoredQueued = false;
         }
         if (frameRenderQueue.isEmpty()) return;
 
@@ -232,6 +255,7 @@ public class NanoVGManager implements IMinecraft {
         synchronized (renderQueueLock) {
             renderQueue.clear();
             frameRenderQueue.clear();
+            worldAnchoredQueued = false;
         }
     }
 
@@ -241,6 +265,7 @@ public class NanoVGManager implements IMinecraft {
 
     private void clearQueues() {
         synchronized (renderQueueLock) {
+            worldAnchoredQueued = false;
             renderQueue.clear();
             frameRenderQueue.clear();
             beforeGuiRenderQueue.clear();
@@ -279,8 +304,6 @@ public class NanoVGManager implements IMinecraft {
         int vertexArray = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
         int arrayBuffer = GL11.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
         int elementArrayBuffer = GL11.glGetInteger(GL15.GL_ELEMENT_ARRAY_BUFFER_BINDING);
-        int readFramebuffer = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
-        int drawFramebuffer = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
         int blendSrcRgb = GL11.glGetInteger(GL14.GL_BLEND_SRC_RGB);
         int blendDstRgb = GL11.glGetInteger(GL14.GL_BLEND_DST_RGB);
         int blendSrcAlpha = GL11.glGetInteger(GL14.GL_BLEND_SRC_ALPHA);
@@ -296,7 +319,6 @@ public class NanoVGManager implements IMinecraft {
         int stencilFail = GL11.glGetInteger(GL11.GL_STENCIL_FAIL);
         int stencilDepthFail = GL11.glGetInteger(GL11.GL_STENCIL_PASS_DEPTH_FAIL);
         int stencilDepthPass = GL11.glGetInteger(GL11.GL_STENCIL_PASS_DEPTH_PASS);
-        GL11.glGetIntegerv(GL11.GL_VIEWPORT, viewport);
         GL11.glGetBooleanv(GL11.GL_COLOR_WRITEMASK, colourWriteMask);
         boolean blend = GL11.glIsEnabled(GL11.GL_BLEND);
         boolean depthTest = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
@@ -306,6 +328,8 @@ public class NanoVGManager implements IMinecraft {
         boolean depthMask = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
 
         boolean frameStarted = false;
+        boolean frameStateEntered = false;
+        Shader2DRenderer.NanoVgFrameState previousFrameState = null;
         try {
             GL11.glEnable(GL11.GL_BLEND);
             GL13.glActiveTexture(GL13.GL_TEXTURE0);
@@ -316,6 +340,8 @@ public class NanoVGManager implements IMinecraft {
             GL11.glDepthMask(false);
             GL11.glDisable(GL11.GL_CULL_FACE);
             GL11.glDisable(GL11.GL_SCISSOR_TEST);
+            previousFrameState = Shader2DRenderer.enterNanoVgFrameState();
+            frameStateEntered = true;
 
             int width = mc.getWindow().getScreenWidth();
             int height = mc.getWindow().getScreenHeight();
@@ -343,8 +369,13 @@ public class NanoVGManager implements IMinecraft {
             }
         } finally {
             try {
-                if (frameStarted) {
-                    instance.endFrame();
+                try {
+                    if (frameStarted) {
+                        instance.endFrame();
+                    }
+                } finally {
+                    if (frameStateEntered)
+                        Shader2DRenderer.exitNanoVgFrameState(previousFrameState);
                 }
             } finally {
                 // NanoVG flushing may fail. Never leave Minecraft's GL state partially replaced.
@@ -362,9 +393,6 @@ public class NanoVGManager implements IMinecraft {
                 GL11.glStencilOp(stencilFail, stencilDepthFail, stencilDepthPass);
                 GL11.glColorMask(colourWriteMask.get(0) != 0, colourWriteMask.get(1) != 0, colourWriteMask.get(2) != 0, colourWriteMask.get(3) != 0);
                 GL11.glDepthMask(depthMask);
-                GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, readFramebuffer);
-                GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, drawFramebuffer);
-                GL11.glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
                 GL20.glUseProgram(program);
                 GL30.glBindVertexArray(vertexArray);
                 GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, arrayBuffer);

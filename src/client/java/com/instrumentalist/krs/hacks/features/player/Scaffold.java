@@ -18,6 +18,7 @@ import com.instrumentalist.krs.utils.math.TimerUtil;
 import com.instrumentalist.krs.utils.move.InputUtil;
 import com.instrumentalist.krs.utils.move.MovementUtil;
 import com.instrumentalist.krs.utils.packet.PacketUtil;
+import com.instrumentalist.krs.utils.render.BlockHighlight;
 import com.instrumentalist.krs.utils.value.BooleanValue;
 import com.instrumentalist.krs.utils.value.FloatValue;
 import com.instrumentalist.krs.utils.value.IntValue;
@@ -78,6 +79,9 @@ public class Scaffold extends Module {
 
     @Setting
     private static final ListValue mode = new ListValue("Mode", new String[]{"Normal", "Telly"}, "Normal");
+
+    @Setting
+    private static final ListValue swingOrderMode = new ListValue("Swing Order Mode", new String[]{"Normal", "Packet"}, "Packet");
 
     @Setting
     private static final BooleanValue tower = new BooleanValue("Tower", true);
@@ -193,6 +197,8 @@ public class Scaffold extends Module {
     private final ArrayList<BlockPos> scaffoldCandidates = new ArrayList<>(64);
     private final ArrayList<BlockPos> scaffoldDistanceCandidates = new ArrayList<>(32);
     private final HashSet<BlockPos> scaffoldCandidateSet = new HashSet<>(64);
+    private static final long HIGHLIGHT_HOLD_MILLIS = 900L;
+    private final BlockHighlight blockHighlight = new BlockHighlight(0.45f);
 
     private record PlacementTarget(BlockPos pos, BlockPos neighbour, Vec3 hitPos, Direction side, int searchDistance) {
     }
@@ -269,6 +275,7 @@ public class Scaffold extends Module {
         resetRotationHumanization();
         updateAutoSneak(false);
         PlayerUtil.INSTANCE.stopSpoof();
+        blockHighlight.release();
     }
 
     @Override
@@ -1712,6 +1719,8 @@ public class Scaffold extends Module {
     }
 
     private static boolean isScaffoldReplaceable(BlockState state) {
+        if (state.getBlock() instanceof SnowLayerBlock)
+            return state.getValue(SnowLayerBlock.LAYERS) == 1;
         return state.canBeReplaced();
     }
 
@@ -2326,7 +2335,6 @@ public class Scaffold extends Module {
 
             BlockHitResult bhr = new BlockHitResult(target.hitPos(), target.side(), target.neighbour(), false);
             if (!rotationMode.get().equalsIgnoreCase("none") && !isPlacementBypassRotationMode(target) && !isNoHitCheckActive(target)) {
-                facePlacementTarget(target);
                 BlockHitResult currentHit = currentPlacementHit(target);
                 if (currentHit == null)
                     return false;
@@ -2339,13 +2347,14 @@ public class Scaffold extends Module {
             if (placed) {
                 placedScaffoldBlock = true;
                 lastPlacedScaffoldBlock = new BlockPos(target.pos().getX(), target.pos().getY(), target.pos().getZ());
+                blockHighlight.flash(lastPlacedScaffoldBlock, HIGHLIGHT_HOLD_MILLIS);
                 startedScaffold = true;
                 if (shouldActivateTellyAfterPlaceNoHitCheck(player))
                     tellyAfterPlaceNoHitCheckActive = true;
                 clearMathPlacementTarget();
                 if (isSnapRotationActive())
                     snapRotationResetPending = true;
-                // The server broadcasts the placement swing on its own since 26.3.
+                PlayerUtil.INSTANCE.swingInteractHand(hand, swingOrderMode.get());
             }
 
             return placed;
@@ -2763,10 +2772,17 @@ public class Scaffold extends Module {
     }
 
     private boolean isMatchingPlacementHit(BlockHitResult hit, BlockPos neighbour, Direction side) {
-        return hit != null
-                && hit.getType() == HitResult.Type.BLOCK
-                && hit.getBlockPos().equals(neighbour)
-                && hit.getDirection() == side;
+        if (hit == null || hit.getType() != HitResult.Type.BLOCK)
+            return false;
+
+        BlockPos hitPos = hit.getBlockPos();
+        if (hitPos.equals(neighbour))
+            return hit.getDirection() == side;
+
+        var level = mc.level;
+        return level != null
+                && hitPos.equals(neighbour.relative(side))
+                && isScaffoldReplaceable(level.getBlockState(hitPos));
     }
 
     private void facePlacementTarget(PlacementTarget target) {

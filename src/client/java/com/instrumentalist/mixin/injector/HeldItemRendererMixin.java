@@ -5,6 +5,7 @@ import com.instrumentalist.krs.hacks.ModuleManager;
 import com.instrumentalist.krs.hacks.features.render.OldHitting;
 import com.instrumentalist.krs.hacks.features.render.ViewModel;
 import com.instrumentalist.krs.utils.entity.PlayerUtil;
+import com.instrumentalist.krs.utils.render.custommodel.CustomModelRenderer;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.math.Axis;
 import org.spongepowered.asm.mixin.Mixin;
@@ -44,7 +45,7 @@ public abstract class HeldItemRendererMixin implements IMinecraft {
         float realEquipProgress = equipProgress;
         float sizeModifier = getItemModelScale();
 
-        if (ModuleManager.getModuleState(ViewModel.class) && ViewModel.noEquipAnimation.get())
+        if (ViewModel.shouldSkipEquipAnimation())
             realEquipProgress = 0f;
 
         matrices.translate(direction * 0.56F, -0.52F, -0.71999997F);
@@ -143,20 +144,20 @@ public abstract class HeldItemRendererMixin implements IMinecraft {
         float swing = Mth.sin(Mth.sqrt(swingProgress) * (float) Math.PI);
 
         switch (OldHitting.mode.get().toLowerCase(Locale.ROOT)) {
-            case "dash" -> {
-                this.applyFirstPersonItem(matrices, arm, equipProgress / 1.7F, 0.0F);
-
-                this.applyMirroredAxisRotation(matrices, arm, -swing * 22.0F, swing / 2.0F, 0.0F, 9.0F);
-                this.applyMirroredAxisRotation(matrices, arm, -swing * 50.0F, 0.8F, swing / 2.0F, 0.0F);
-
-                this.applyBlockTransformation(matrices, arm);
-            }
-
             case "push" -> {
                 this.applyFirstPersonItem(matrices, arm, equipProgress / 2.0F, 0.0F);
 
                 this.applyMirroredAxisRotation(matrices, arm, -swing * 40.0F / 2.0F, swing / 2.0F, 1.0F, 4.0F);
                 this.applyMirroredAxisRotation(matrices, arm, -swing * 30.0F, 1.0F, swing / 3.0F, 0.0F);
+
+                this.applyBlockTransformation(matrices, arm);
+            }
+
+            case "dash" -> {
+                this.applyFirstPersonItem(matrices, arm, equipProgress / 1.7F, 0.0F);
+
+                this.applyMirroredAxisRotation(matrices, arm, -swing * 22.0F, swing / 2.0F, 0.0F, 9.0F);
+                this.applyMirroredAxisRotation(matrices, arm, -swing * 50.0F, 0.8F, swing / 2.0F, 0.0F);
 
                 this.applyBlockTransformation(matrices, arm);
             }
@@ -170,11 +171,41 @@ public abstract class HeldItemRendererMixin implements IMinecraft {
                 this.applyBlockTransformation(matrices, arm);
             }
 
+            case "swank" -> {
+                this.applyFirstPersonItem(matrices, arm, equipProgress / 2.0F, swingProgress);
+
+                this.applyMirroredAxisRotation(matrices, arm, swing * 30.0F / 2.0F, -swing, 0.0F, 9.0F);
+                this.applyMirroredAxisRotation(matrices, arm, swing * 40.0F, 1.0F, -swing / 2.0F, 0.0F);
+
+                this.applyBlockTransformation(matrices, arm);
+            }
+
             case "swonk" -> {
                 this.applyFirstPersonItem(matrices, arm, equipProgress / 1.6F, 0.0F);
 
                 this.applyMirroredAxisRotation(matrices, arm, -swing * -30.0F / 2.0F, swing / 2.0F, 1.0F, 4.0F);
                 this.applyMirroredAxisRotation(matrices, arm, -swing * 7.5F, 1.0F, swing / 3.0F, 0.0F);
+
+                this.applyBlockTransformation(matrices, arm);
+            }
+
+            case "ethr" -> {
+                matrices.translate((arm == HumanoidArm.RIGHT ? 1 : -1) * -0.08F, 0.1F, 0.0F);
+                this.applyFirstPersonItem(matrices, arm, equipProgress / 1.4F, 0.0F);
+
+                this.applyMirroredAxisRotation(matrices, arm, -swing * 65.0F / 2.0F, swing / 2.0F, 1.0F, 4.0F);
+                this.applyMirroredAxisRotation(matrices, arm, -swing * 60.0F, 1.0F, swing / 3.0F, 0.0F);
+
+                this.applyBlockTransformation(matrices, arm);
+            }
+
+            case "spin" -> {
+                float spin = (System.nanoTime() / 1_000_000L % 1000L) / (float) 1000L * 360.0F;
+
+                matrices.rotate(Axis.ZP.rotationDegrees(-spin));
+                matrices.translate((arm == HumanoidArm.RIGHT ? 1 : -1) * (-0.05F + 0.15F * 0.85F), 0.2F - 0.15F * 0.53F, 0.0F);
+
+                this.applyFirstPersonItem(matrices, arm, equipProgress / 1.8F, 0.0F);
 
                 this.applyBlockTransformation(matrices, arm);
             }
@@ -201,6 +232,13 @@ public abstract class HeldItemRendererMixin implements IMinecraft {
     private void armModifierHook(PoseStack matrices, SubmitNodeCollector submitter, int light, float equipProgress, float swingProgress, HumanoidArm arm, PlayerRenderState playerState, CallbackInfo ci) {
         if (this.shouldUseCustomEquipOffset())
             this.customRenderArmHoldingItem(matrices, submitter, light, equipProgress, swingProgress, arm, playerState, ci);
+    }
+
+    @Inject(method = "renderPlayerHand", at = @At("HEAD"), cancellable = true)
+    private void customModelHandHook(PoseStack matrices, SubmitNodeCollector submitter, int light, HumanoidArm arm, PlayerRenderState playerState, CallbackInfo ci) {
+        if (playerState.avatarRenderState != null
+                && CustomModelRenderer.trySubmitFirstPersonHand(playerState.avatarRenderState, matrices, submitter, light, arm))
+            ci.cancel();
     }
 
     @Inject(method = "swingArm", at = @At("HEAD"), cancellable = true)
@@ -240,7 +278,7 @@ public abstract class HeldItemRendererMixin implements IMinecraft {
         float realEquipProgress = equipProgress;
         float sizeModifier = getItemModelScale();
 
-        if (ModuleManager.getModuleState(ViewModel.class) && ViewModel.noEquipAnimation.get())
+        if (ViewModel.shouldSkipEquipAnimation())
             realEquipProgress = 0f;
 
         int i = arm == HumanoidArm.RIGHT ? 1 : -1;
@@ -273,7 +311,7 @@ public abstract class HeldItemRendererMixin implements IMinecraft {
 
         float realEquipProgress = equipProgress;
 
-        if (ModuleManager.getModuleState(ViewModel.class) && ViewModel.noEquipAnimation.get())
+        if (ViewModel.shouldSkipEquipAnimation())
             realEquipProgress = 0f;
 
         boolean bl = arm != HumanoidArm.LEFT;
@@ -450,7 +488,7 @@ public abstract class HeldItemRendererMixin implements IMinecraft {
 
     @Unique
     private boolean shouldUseCustomEquipOffset() {
-        return ModuleManager.getModuleState(ViewModel.class) && (ViewModel.noEquipAnimation.get() || getItemModelScale() != 1.0F || hasCustomItemPosition());
+        return ViewModel.shouldSkipEquipAnimation() || ModuleManager.getModuleState(ViewModel.class) && (getItemModelScale() != 1.0F || hasCustomItemPosition());
     }
 
     @Unique

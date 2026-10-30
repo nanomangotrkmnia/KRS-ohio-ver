@@ -60,6 +60,7 @@ import com.instrumentalist.krs.utils.input.Keys;
 import org.lwjgl.nanovg.NanoVG;
 import org.nvgu.NVGU;
 import org.nvgu.util.Alignment;
+import org.nvgu.util.NVGFont;
 
 import java.awt.Color;
 import java.io.InputStream;
@@ -82,7 +83,22 @@ public class Interface extends Module {
     private static final ThreadLocal<DecimalFormat> ONE_DECIMAL_FORMAT = ThreadLocal.withInitial(() -> new DecimalFormat("0.0"));
     private static final float MODULE_LIST_FONT_SIZE = 15f;
     private static final float HUD_FONT_SIZE = 15f;
-    private static final Color MODULE_LIST_TAG_COLOR = new Color(0xC8, 0xC8, 0xC2);
+    private static final float INFO_HUD_ICON_GAP = 4f;
+    private static final Color MODULE_LIST_TAG_COLOR = new Color(170, 170, 170);
+    private static final float MODULE_LIST_HORIZONTAL_GRADIENT_SPAN = 300f;
+    private static final float WATERMARK_FADE_LENGTH = 0.7f;
+    private static final int WATERMARK_SOFT_WHITE = 232;
+    private static final int FADE_LUT_SIZE = 2048;
+    private static final int[] FADE_RGB = new int[FADE_LUT_SIZE];
+    private static final Color[] FADE_OPAQUE_COLORS = new Color[FADE_LUT_SIZE];
+
+    static {
+        for (int i = 0; i < FADE_LUT_SIZE; i++) {
+            int rgb = computeFadedRgb(i / (float) FADE_LUT_SIZE);
+            FADE_RGB[i] = rgb;
+            FADE_OPAQUE_COLORS[i] = new Color((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, 255);
+        }
+    }
     private static long cachedTimeSecond = -1L;
     private static String cachedTimeText = "00:00:00";
 
@@ -181,6 +197,15 @@ public class Interface extends Module {
             true
     );
 
+    @Setting
+    public static final FloatValue shadowStrength = new FloatValue(
+            "Shadow Strength",
+            1f,
+            0f,
+            3f,
+            "x"
+    );
+
     public static List<Module> sortedModules;
 
     private static volatile boolean sortedModulesDirty = true;
@@ -252,9 +277,7 @@ public class Interface extends Module {
     private int tabGuiModuleIndex;
     private boolean tabGuiExpanded;
     private float tabGuiExpandProgress;
-    private float tabGuiCategorySelectionY = Float.NaN;
     private float tabGuiModuleSelectionY = Float.NaN;
-    private final Map<Module, Float> tabGuiEnabledWashes = new IdentityHashMap<>();
 
     private static class ModuleListEntry {
         String text;
@@ -299,14 +322,16 @@ public class Interface extends Module {
         float textX;
         float textY;
         int alpha;
-        Color textColor;
+        int colorIndex;
+        int colorCount;
+        long colorTimeMillis;
         float topLeftRadius;
         float topRightRadius;
         float bottomRightRadius;
         float bottomLeftRadius;
 
         void update(ModuleListEntry entry, float x, float y, float width, float height,
-                    float textX, float textY, int alpha, Color textColor) {
+                    float textX, float textY, int alpha, int colorIndex, int colorCount, long colorTimeMillis) {
             this.entry = entry;
             this.x = x;
             this.y = y;
@@ -315,7 +340,9 @@ public class Interface extends Module {
             this.textX = textX;
             this.textY = textY;
             this.alpha = alpha;
-            this.textColor = textColor;
+            this.colorIndex = colorIndex;
+            this.colorCount = colorCount;
+            this.colorTimeMillis = colorTimeMillis;
         }
 
         void updateCornerRadii(float topLeft, float topRight, float bottomRight, float bottomLeft) {
@@ -431,14 +458,18 @@ public class Interface extends Module {
 
     private static class InfoHudEntry implements ConnectedHudRect {
         final String text;
+        final @Nullable String icon;
+        final float iconWidth;
         final float width;
         final float height;
         float x;
         float y;
 
-        InfoHudEntry(String text) {
+        InfoHudEntry(String text, @Nullable String icon) {
             this.text = text;
-            this.width = NVGFonts.INTER.getWidth(text, HUD_FONT_SIZE) + 16f;
+            this.icon = icon;
+            this.iconWidth = icon != null ? NVGFonts.ICON.getWidth(icon, HUD_FONT_SIZE) + INFO_HUD_ICON_GAP : 0f;
+            this.width = NVGFonts.INTER.getWidth(text, HUD_FONT_SIZE) + iconWidth + 16f;
             this.height = NVGFonts.INTER.getHeight(HUD_FONT_SIZE) + 8f;
         }
 
@@ -484,11 +515,29 @@ public class Interface extends Module {
     }
 
     public static Color getFadedColor(int index, int totalModules) {
-        return getFadedColor(index, totalModules, 255, System.currentTimeMillis());
+        return getFadedColor(index, totalModules, 255, System.currentTimeMillis(), 0f);
     }
 
-    private static Color getFadedColor(int index, int totalModules, int alpha, long currentTimeMillis) {
-        return NanoVGTheme.accent(alpha);
+    private static Color getFadedColor(int index, int totalModules, int alpha, long currentTimeMillis, float phaseOffset) {
+        totalModules = Math.max(1, totalModules);
+        float cycleDuration = 2000f;
+        float progress = ((currentTimeMillis % (long) cycleDuration) / cycleDuration + (float) index / totalModules + phaseOffset) % 1.0f;
+        if (progress < 0f)
+            progress += 1.0f;
+
+        int lutIndex = (int) (progress * FADE_LUT_SIZE + 0.5f) & (FADE_LUT_SIZE - 1);
+        int clampedAlpha = Math.clamp(alpha, 0, 255);
+        if (clampedAlpha == 255)
+            return FADE_OPAQUE_COLORS[lutIndex];
+
+        int rgb = FADE_RGB[lutIndex];
+        return new Color((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, clampedAlpha);
+    }
+
+    private static int computeFadedRgb(float progress) {
+        progress = 0.5f - 0.5f * (float) Math.cos(progress * 2 * Math.PI);
+        float saturation = 0.8f - 0.22f * (float) Math.sin(progress * Math.PI);
+        return Color.HSBtoRGB((180f + 120f * progress) / 360f, saturation, 1f) & 0xFFFFFF;
     }
 
     private static String getCachedTimeText() {
@@ -674,7 +723,7 @@ public class Interface extends Module {
 
     private static void preparePlayerListRows(List<PlayerInfo> players) {
         playerListRowBuffer.clear();
-        float height = 28f + 6f;
+        float height = 6f + 6f;
         int visiblePlayers = Math.min(players.size(), 10);
         for (int i = 0; i < visiblePlayers; i++) {
             PlayerInfo entry = players.get(i);
@@ -742,8 +791,8 @@ public class Interface extends Module {
         String positionText = formatPositionText(x, y, z, netherX, netherZ, mc.player.getDirection().getSerializedName().toUpperCase(Locale.ROOT));
         List<InfoHudEntry> informationEntries = informationEntryBuffer;
         informationEntries.clear();
-        informationEntries.add(new InfoHudEntry(getCachedTimeText()));
-        informationEntries.add(new InfoHudEntry(positionText));
+        informationEntries.add(new InfoHudEntry(getCachedTimeText(), MaterialIcon.CLOCK));
+        informationEntries.add(new InfoHudEntry(positionText, MaterialIcon.CORDS));
         layoutConnectedInfoHudChips(informationEntries, infoLeftX, baseY + informationEntries.get(0).height);
 
         Map<Holder<MobEffect>, MobEffectInstance> activeEffects = mc.player.getActiveEffectsMap();
@@ -810,12 +859,12 @@ public class Interface extends Module {
         List<InfoHudEntry> connectionEntries = connectionEntryBuffer;
         connectionEntries.clear();
 
-        connectionEntries.add(new InfoHudEntry(connectionType));
+        connectionEntries.add(new InfoHudEntry(connectionType, MaterialIcon.PUBLIC));
 
         if (!connectionType.equals("Singleplayer")) {
             String pingText = (ping >= 0) ? ping + "ms" : "Unknown";
-            connectionEntries.add(new InfoHudEntry(serverIp));
-            connectionEntries.add(new InfoHudEntry(pingText));
+            connectionEntries.add(new InfoHudEntry(serverIp, MaterialIcon.LAN));
+            connectionEntries.add(new InfoHudEntry(pingText, MaterialIcon.SIGNAL));
         }
 
         layoutConnectedInfoHudChips(connectionEntries, leftX, startY);
@@ -832,9 +881,9 @@ public class Interface extends Module {
     }
 
     private static void renderSomeInformationEffects(NVGU vg, SomeInformationRenderState state) {
-        NanoVGTheme.renderConnectedEffects(vg, state.informationEntries, 8f, 1f);
-        NanoVGTheme.renderConnectedEffects(vg, state.potionEntries, 8f, 1f);
-        NanoVGTheme.renderConnectedEffects(vg, state.connectionEntries, 8f, 1f);
+        NanoVGTheme.renderConnectedEffects(vg, state.informationEntries, NanoVGTheme.RADIUS_HUD, 1f);
+        NanoVGTheme.renderConnectedEffects(vg, state.potionEntries, NanoVGTheme.RADIUS_HUD, 1f);
+        NanoVGTheme.renderConnectedEffects(vg, state.connectionEntries, NanoVGTheme.RADIUS_HUD, 1f);
     }
 
     private static void renderSomeInformationBody(NVGU vg, SomeInformationRenderState state) {
@@ -866,11 +915,11 @@ public class Interface extends Module {
     }
 
     private static void renderConnectedInfoHudChipEffects(NVGU vg, List<InfoHudEntry> entries, float alpha) {
-        NanoVGTheme.renderConnectedEffects(vg, entries, 8f, alpha);
+        NanoVGTheme.renderConnectedEffects(vg, entries, NanoVGTheme.RADIUS_HUD, alpha);
     }
 
     private static void renderConnectedInfoHudChipBodies(NVGU vg, List<InfoHudEntry> entries, float alpha) {
-        NanoVGTheme.renderConnected(vg, entries, 8f, alpha);
+        NanoVGTheme.renderConnected(vg, entries, NanoVGTheme.RADIUS_HUD, alpha);
 
         for (InfoHudEntry entry : entries) {
             renderInfoHudChipText(entry);
@@ -878,10 +927,10 @@ public class Interface extends Module {
     }
 
     private static void renderPotionHudBodies(NVGU vg, List<PotionHudEntry> potionEntries) {
-        NanoVGTheme.renderConnected(vg, potionEntries, 8f, 1f);
+        NanoVGTheme.renderConnected(vg, potionEntries, NanoVGTheme.RADIUS_HUD, 1f);
         for (int i = 0, n = potionEntries.size(); i < n; i++) {
             PotionHudEntry entry = potionEntries.get(i);
-            NVGFonts.INTER.drawText(entry.text, entry.textX, entry.textY, HUD_FONT_SIZE, NanoVGTheme.TEXT, Alignment.RIGHT_TOP, false);
+            NVGFonts.INTER.drawText(entry.text, entry.textX, entry.textY, HUD_FONT_SIZE, NanoVGTheme.ACCENT, Alignment.RIGHT_TOP, true);
         }
     }
 
@@ -898,7 +947,9 @@ public class Interface extends Module {
     }
 
     private static void renderInfoHudChipText(InfoHudEntry entry) {
-        NVGFonts.INTER.drawText(entry.text, entry.x + 8f, entry.y + 4f, HUD_FONT_SIZE, NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+        if (entry.icon != null)
+            NVGFonts.ICON.drawText(entry.icon, entry.x + 8f, entry.y + 3f, HUD_FONT_SIZE, NanoVGTheme.ACCENT, Alignment.LEFT_TOP, true);
+        NVGFonts.INTER.drawText(entry.text, entry.x + 8f + entry.iconWidth, entry.y + 4f, HUD_FONT_SIZE, NanoVGTheme.ACCENT, Alignment.LEFT_TOP, true);
     }
 
     private static float getChatScreenOffset() {
@@ -918,7 +969,7 @@ public class Interface extends Module {
         float visibleChatHeight = visibleLines * chatLineHeight * chatScale;
 
         if (visibleLines == 0f) {
-            return 438f;
+            return 278f;
         }
 
         return (40f + visibleChatHeight) * guiToNanoVgScale - 30f + (16f + 12f);
@@ -1141,8 +1192,6 @@ public class Interface extends Module {
                 1.0f
         );
 
-        // A newly acquired target starts below this threshold at high frame rates.
-        // Only retire a state after the target is actually inactive and has faded out.
         if (!activeTarget && state.targetHudAlpha < 0.1f) {
             state.previousHealthRatio = 0.5f;
             state.previousRegenRatio = 0.5f;
@@ -1430,27 +1479,22 @@ public class Interface extends Module {
         if (height <= 0.01f)
             return;
 
-        List<PlayerInfo> players = getPlayerListEntries();
+        getPlayerListEntries();
         float x = getLeftHudX();
         float y = getLeftHudTopY();
-        int totalPlayers = players.size();
         int visiblePlayers = playerListRowBuffer.size();
-        String countText = totalPlayers > visiblePlayers ? visiblePlayers + "/" + totalPlayers : String.valueOf(totalPlayers);
 
         NanoVGTheme.renderPanel(vg, x, y, 240f, height, NanoVGTheme.RADIUS_HUD, 1f);
 
         vg.pushScissor(x, y, 240f, height);
-        NVGFonts.INTER.drawText("Players", x + 12f, y + 6f, HUD_FONT_SIZE, NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
-        NVGFonts.INTER.drawText(countText, x + 12f + NVGFonts.INTER.getWidth("Players", HUD_FONT_SIZE) + 6f, y + 6f, HUD_FONT_SIZE, NanoVGTheme.MUTED, Alignment.LEFT_TOP, false);
-
-        float rowY = y + 28f;
+        float rowY = y + 6f;
         for (int i = 0; i < visiblePlayers; i++) {
             PlayerListRow row = playerListRowBuffer.get(i);
 
             for (int line = 0; line < row.nameLines.size(); line++) {
-                NVGFonts.INTER.drawText(row.nameLines.get(line), x + 12f, rowY + 3f + line * 16f, HUD_FONT_SIZE, row.nameColor, Alignment.LEFT_TOP, false);
+                NVGFonts.INTER.drawText(row.nameLines.get(line), x + 12f, rowY + 3f + line * 16f, HUD_FONT_SIZE, row.nameColor, Alignment.LEFT_TOP, true);
             }
-            NVGFonts.INTER.drawText(row.pingText, x + 240f - 10f, rowY + 4f, 13f, row.pingColor, Alignment.RIGHT_TOP, false);
+            NVGFonts.INTER.drawText(row.pingText, x + 240f - 10f, rowY + 4f, 13f, row.pingColor, Alignment.RIGHT_TOP, true);
 
             rowY += row.rowHeight;
         }
@@ -1607,7 +1651,7 @@ public class Interface extends Module {
         float centerX = mapX + halfSize;
         float centerY = mapY + halfSize;
 
-        NanoVGTheme.renderPanel(vg, mapX, mapY, 150f, 150f, 20f, 1f);
+        NanoVGTheme.renderPanel(vg, mapX, mapY, 150f, 150f, NanoVGTheme.RADIUS_MENU, 1f);
         float blockScale = (150f - 12f) / (MINIMAP_VISIBLE_RADIUS_BLOCKS * 2f);
         renderMinimapTerrain(vg, mapX, mapY, centerX, centerY, blockScale, viewX, viewZ);
         vg.line(centerX, mapY + 7f, centerX, mapY + 150f - 7f, 1f, new Color(255, 255, 255, 28));
@@ -1632,7 +1676,7 @@ public class Interface extends Module {
         float mapX = getLeftHudX();
         float mapY = getMinimapY();
 
-        NanoVGTheme.renderPanelEffects(vg, mapX, mapY, 150f, 150f, 20f, 1f);
+        NanoVGTheme.renderPanelEffects(vg, mapX, mapY, 150f, 150f, NanoVGTheme.RADIUS_MENU, 1f);
     }
 
     private void renderMinimapTerrain(NVGU vg, float mapX, float mapY, float centerX, float centerY, float blockScale, double viewX, double viewZ) {
@@ -1656,8 +1700,6 @@ public class Interface extends Module {
         if (clipRight <= clipX || clipBottom <= clipY)
             return;
 
-        // Never sample outside the cached image. NanoVG otherwise clamps the last
-        // texel and stretches it into a band while the view moves near an edge.
         vg.scissor(clipX, clipY, clipRight - clipX, clipBottom - clipY, () ->
                 vg.roundedRectangle(
                         terrainX,
@@ -2119,7 +2161,7 @@ public class Interface extends Module {
         Color textColor = NanoVGTheme.text((int) (255 * alpha));
 
         NanoVGTheme.renderCompact(vg, x - textWidth / 2f, y, textWidth, textHeight, NanoVGTheme.RADIUS_HUD, alpha);
-        NVGFonts.INTER.drawText(text, x, y + 4f, HUD_FONT_SIZE, textColor, Alignment.CENTER_TOP, false);
+        NVGFonts.INTER.drawText(text, x, y + 4f, HUD_FONT_SIZE, textColor, Alignment.CENTER_TOP, true);
     }
 
     private List<ModuleCategory> prepareTabGuiCategories() {
@@ -2195,19 +2237,13 @@ public class Interface extends Module {
 
     private void updateTabGuiAnimations(float deltaSpeed, List<ModuleCategory> categories, List<Module> modules) {
         tabGuiExpandProgress = animateTabGuiValue(tabGuiExpandProgress, tabGuiExpanded && !modules.isEmpty() ? 1f : 0f, deltaSpeed);
-        updateTabGuiEnabledWashes(modules, deltaSpeed);
 
         if (categories.isEmpty()) {
-            tabGuiCategorySelectionY = Float.NaN;
             tabGuiModuleSelectionY = Float.NaN;
             return;
         }
 
         float y = getTabGuiBaseY();
-        float targetCategorySelectionY = y + 6f + tabGuiCategoryIndex * 22f;
-        tabGuiCategorySelectionY = Float.isNaN(tabGuiCategorySelectionY)
-                ? targetCategorySelectionY
-                : animateTabGuiValue(tabGuiCategorySelectionY, targetCategorySelectionY, deltaSpeed);
 
         if (modules.isEmpty()) {
             tabGuiModuleSelectionY = Float.NaN;
@@ -2265,14 +2301,13 @@ public class Interface extends Module {
 
         NanoVGTheme.renderPanel(vg, x, y, categoryWidth, categoryHeight, NanoVGTheme.RADIUS_HUD, 1f);
 
-        if (!Float.isNaN(tabGuiCategorySelectionY)) {
-            renderTabGuiSelectionMark(vg, x, tabGuiCategorySelectionY, categoryWidth);
-        }
-
         for (int i = 0, n = categories.size(); i < n; i++) {
             ModuleCategory category = categories.get(i);
             float rowY = y + 6f + i * 22f;
-            NVGFonts.INTER.drawText(category.name(), x + 12f, rowY + 3f, HUD_FONT_SIZE, NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+            boolean selected = i == tabGuiCategoryIndex;
+            Color categoryColor = selected ? NanoVGTheme.ACCENT : NanoVGTheme.TEXT;
+            NVGFont categoryFont = selected ? NVGFonts.INTER_MEDIUM : NVGFonts.INTER;
+            categoryFont.drawText(category.name(), x + 12f, rowY + 3f, HUD_FONT_SIZE, categoryColor, Alignment.LEFT_TOP, true);
         }
 
         if (expandProgress > 0.01f && !modules.isEmpty()) {
@@ -2293,15 +2328,6 @@ public class Interface extends Module {
             NanoVGTheme.renderPanel(vg, x, y, width, height, NanoVGTheme.RADIUS_HUD, 1f);
 
             int lastModule = Math.min(modules.size(), firstModule + visibleRows);
-            for (int i = firstModule; i < lastModule; i++) {
-                Module module = modules.get(i);
-                float wash = tabGuiEnabledWashes.getOrDefault(module, module.tempEnabled ? 1f : 0f);
-                if (wash <= 0.01f)
-                    continue;
-                float rowY = y + 6f + (i - firstModule) * 22f;
-                renderTabGuiRowWash(vg, x, rowY, width, wash);
-            }
-
             if (!Float.isNaN(tabGuiModuleSelectionY)) {
                 renderTabGuiSelectionMark(vg, x, tabGuiModuleSelectionY, width);
             }
@@ -2309,7 +2335,8 @@ public class Interface extends Module {
             for (int i = firstModule; i < lastModule; i++) {
                 Module module = modules.get(i);
                 float rowY = y + 6f + (i - firstModule) * 22f;
-                NVGFonts.INTER.drawText(module.moduleName, x + 12f, rowY + 3f, HUD_FONT_SIZE, NanoVGTheme.TEXT, Alignment.LEFT_TOP, false);
+                NVGFont moduleFont = module.tempEnabled ? NVGFonts.INTER_MEDIUM : NVGFonts.INTER;
+                moduleFont.drawText(module.moduleName, x + 12f, rowY + 3f, HUD_FONT_SIZE, NanoVGTheme.TEXT, Alignment.LEFT_TOP, true);
             }
 
             if (modules.size() > visibleRows) {
@@ -2323,31 +2350,6 @@ public class Interface extends Module {
         vg.popScissor();
     }
 
-    private void updateTabGuiEnabledWashes(List<Module> modules, float deltaSpeed) {
-        float amount = Math.clamp(deltaSpeed * 0.9f, 0.08f, 1f);
-        for (int i = 0, n = modules.size(); i < n; i++) {
-            Module module = modules.get(i);
-            float target = module.tempEnabled ? 1f : 0f;
-            Float current = tabGuiEnabledWashes.get(module);
-            if (current == null) {
-                tabGuiEnabledWashes.put(module, target);
-                continue;
-            }
-            float next = current + (target - current) * amount;
-            if (next <= 0.001f && target == 0f)
-                tabGuiEnabledWashes.remove(module);
-            else
-                tabGuiEnabledWashes.put(module, next);
-        }
-    }
-
-    private static void renderTabGuiRowWash(NVGU vg, float x, float y, float width, float progress) {
-        int alpha = Math.clamp(Math.round(18f * Math.clamp(progress, 0f, 1f)), 0, 255);
-        if (alpha <= 0)
-            return;
-        vg.roundedRectangle(x + 6f, y + 1f, width - 12f, 20f, 4f, new Color(255, 255, 255, alpha));
-    }
-
     private static void renderTabGuiSelectionMark(NVGU vg, float x, float y, float width) {
         vg.roundedRectangle(x + 6f, y + 4f, 2f, 14f, 1f, new Color(255, 255, 255, 220));
     }
@@ -2355,7 +2357,7 @@ public class Interface extends Module {
     private float getTabGuiCategoryPanelWidth(List<ModuleCategory> categories) {
         float width = 72f;
         for (ModuleCategory category : categories) {
-            width = Math.max(width, NVGFonts.INTER.getWidth(category.name(), HUD_FONT_SIZE) + 24f);
+            width = Math.max(width, NVGFonts.INTER_MEDIUM.getWidth(category.name(), HUD_FONT_SIZE) + 24f);
         }
         return width;
     }
@@ -2363,7 +2365,7 @@ public class Interface extends Module {
     private float getTabGuiModulePanelWidth(List<Module> modules) {
         float width = 72f;
         for (Module module : modules) {
-            width = Math.max(width, NVGFonts.INTER.getWidth(module.moduleName, HUD_FONT_SIZE) + 24f);
+            width = Math.max(width, NVGFonts.INTER_MEDIUM.getWidth(module.moduleName, HUD_FONT_SIZE) + 24f);
         }
         return width;
     }
@@ -2495,6 +2497,7 @@ public class Interface extends Module {
             return renderEntries;
 
         int visibleIndex = 0;
+        long colorTimeMillis = System.currentTimeMillis();
         for (ModuleListEntry entry : entries) {
             if (rowHeight * entry.progress <= 0.5f)
                 continue;
@@ -2506,7 +2509,6 @@ public class Interface extends Module {
             float bottomPadding = visibleIndex == visibleCount - 1 ? 6f : 2f;
             float effectiveHeight = (fontHeight + topPadding + bottomPadding) * entry.progress;
             float textY = listY + topPadding;
-            Color textColor = alphaColor(0xF6, 0xF6, 0xF1, alpha);
 
             while (moduleListRenderEntryPool.size() <= visibleIndex)
                 moduleListRenderEntryPool.add(new ModuleListRenderEntry());
@@ -2520,7 +2522,9 @@ public class Interface extends Module {
                     textX,
                     textY,
                     alpha,
-                    textColor
+                    visibleIndex,
+                    visibleCount,
+                    colorTimeMillis
             );
             renderEntries.add(renderEntry);
             listY += effectiveHeight;
@@ -2529,7 +2533,7 @@ public class Interface extends Module {
 
         for (int i = 0, n = renderEntries.size(); i < n; i++) {
             ModuleListRenderEntry entry = renderEntries.get(i);
-            float radius = Math.min(8f, entry.height / 2f);
+            float radius = Math.min(NanoVGTheme.RADIUS_HUD, entry.height / 2f);
             ConnectedHudRect previous = i > 0 ? renderEntries.get(i - 1) : null;
             ConnectedHudRect next = i + 1 < n ? renderEntries.get(i + 1) : null;
             entry.updateCornerRadii(
@@ -2549,21 +2553,87 @@ public class Interface extends Module {
         float effectAlpha = 0f;
         for (ModuleListRenderEntry entry : renderEntries)
             effectAlpha = Math.max(effectAlpha, entry.alpha / 255f);
-        NanoVGTheme.renderConnectedEffects(vg, renderEntries, 8f, effectAlpha);
+        NanoVGTheme.renderConnectedEffects(vg, renderEntries, NanoVGTheme.RADIUS_HUD, effectAlpha);
     }
+
+    private static final class ModuleListGlyphColour implements NVGU.GlyphColour {
+        private int index;
+        private int count;
+        private int alpha;
+        private long timeMillis;
+        private float originX;
+
+        private void update(ModuleListRenderEntry entry) {
+            this.index = entry.colorIndex;
+            this.count = entry.colorCount;
+            this.alpha = entry.alpha;
+            this.timeMillis = entry.colorTimeMillis;
+            this.originX = entry.right();
+        }
+
+        @Override
+        public Color colourAt(float glyphCenterX) {
+            return getFadedColor(index, count, alpha, timeMillis, (originX - glyphCenterX) / MODULE_LIST_HORIZONTAL_GRADIENT_SPAN);
+        }
+    }
+
+    private final ModuleListGlyphColour moduleListGlyphColour = new ModuleListGlyphColour();
+
+    private static final class WatermarkGlyphColour implements NVGU.GlyphColour {
+        private long timeMillis;
+        private float originX;
+        private float startX;
+        private float endX;
+        private int fadeTarget = 255;
+
+        private void update(String text, float x, float size, int fadeTarget) {
+            this.fadeTarget = fadeTarget;
+            this.timeMillis = System.currentTimeMillis();
+            this.originX = x;
+            if (text.isEmpty()) {
+                this.startX = x;
+                this.endX = x;
+                return;
+            }
+
+            int firstEnd = text.offsetByCodePoints(0, 1);
+            int lastStart = text.offsetByCodePoints(text.length(), -1);
+            float width = NVGFonts.INTER.getWidth(text, size);
+            this.startX = x + NVGFonts.INTER.getWidth(text.substring(0, firstEnd), size) * 0.5f;
+            this.endX = x + width - NVGFonts.INTER.getWidth(text.substring(lastStart), size) * 0.5f;
+        }
+
+        @Override
+        public Color colourAt(float glyphCenterX) {
+            Color rainbow = getFadedColor(0, 1, 255, timeMillis, (originX - glyphCenterX) / MODULE_LIST_HORIZONTAL_GRADIENT_SPAN);
+            float progress = endX > startX ? Math.clamp((glyphCenterX - startX) / ((endX - startX) * WATERMARK_FADE_LENGTH), 0f, 1f) : 0f;
+            float fade = progress * progress * (3f - 2f * progress);
+            return new Color(
+                    Math.round(rainbow.getRed() + (fadeTarget - rainbow.getRed()) * fade),
+                    Math.round(rainbow.getGreen() + (fadeTarget - rainbow.getGreen()) * fade),
+                    Math.round(rainbow.getBlue() + (fadeTarget - rainbow.getBlue()) * fade),
+                    255
+            );
+        }
+    }
+
+    private final WatermarkGlyphColour watermarkGlyphColour = new WatermarkGlyphColour();
 
     private void renderModuleListBody(NVGU vg, List<ModuleListRenderEntry> renderEntries) {
         if (renderEntries.isEmpty()) return;
 
-        NanoVGTheme.renderConnected(vg, renderEntries, 8f, 1f);
+        NanoVGTheme.renderConnected(vg, renderEntries, NanoVGTheme.RADIUS_HUD, 1f);
+        if (renderModuleListGlyphBatch(vg, renderEntries))
+            return;
 
         for (ModuleListRenderEntry entry : renderEntries) {
             boolean clipAnimatedEntry = entry.alpha != 255;
             if (clipAnimatedEntry)
                 vg.pushScissor(entry.x, entry.y, entry.width, entry.height);
             try {
-                NVGFonts.INTER.drawText(entry.entry.text, entry.textX, entry.textY, MODULE_LIST_FONT_SIZE,
-                        entry.textColor, Alignment.LEFT_TOP, false);
+                moduleListGlyphColour.update(entry);
+                NVGFonts.INTER.drawGradientText(entry.entry.text, entry.textX, entry.textY, MODULE_LIST_FONT_SIZE,
+                        Alignment.LEFT_TOP, true, moduleListGlyphColour);
                 if (entry.entry.tagText != null) {
                     NVGFonts.INTER.drawText(
                             entry.entry.tagText,
@@ -2572,7 +2642,7 @@ public class Interface extends Module {
                             MODULE_LIST_FONT_SIZE,
                             alphaColor(MODULE_LIST_TAG_COLOR.getRed(), MODULE_LIST_TAG_COLOR.getGreen(), MODULE_LIST_TAG_COLOR.getBlue(), entry.alpha),
                             Alignment.LEFT_TOP,
-                            false
+                            true
                     );
                 }
             } finally {
@@ -2580,6 +2650,36 @@ public class Interface extends Module {
                     vg.popScissor();
             }
         }
+    }
+
+    private boolean renderModuleListGlyphBatch(NVGU vg, List<ModuleListRenderEntry> renderEntries) {
+        if (!vg.beginGlyphBatch())
+            return false;
+
+        String font = NVGFonts.INTER.getIdentifier();
+        for (ModuleListRenderEntry entry : renderEntries) {
+            boolean clip = entry.alpha != 255;
+            float clipX = clip ? entry.x : 0f;
+            float clipY = clip ? entry.y : 0f;
+            float clipWidth = clip ? entry.width : Float.POSITIVE_INFINITY;
+            float clipHeight = clip ? entry.height : Float.POSITIVE_INFINITY;
+            moduleListGlyphColour.update(entry);
+            boolean added = vg.addGlyphRun(entry.entry.text, entry.textX, entry.textY, font, MODULE_LIST_FONT_SIZE,
+                    moduleListGlyphColour, null, true, NVGFont.SHADOW_OFFSET, NVGFont.SHADOW_OFFSET,
+                    clipX, clipY, clipWidth, clipHeight);
+            if (added && entry.entry.tagText != null) {
+                added = vg.addGlyphRun(entry.entry.tagText, entry.textX + entry.entry.textWidth, entry.textY, font, MODULE_LIST_FONT_SIZE,
+                        null, alphaColor(MODULE_LIST_TAG_COLOR.getRed(), MODULE_LIST_TAG_COLOR.getGreen(), MODULE_LIST_TAG_COLOR.getBlue(), entry.alpha),
+                        true, NVGFont.SHADOW_OFFSET, NVGFont.SHADOW_OFFSET, clipX, clipY, clipWidth, clipHeight);
+            }
+            if (!added) {
+                vg.cancelGlyphBatch();
+                return false;
+            }
+        }
+
+        vg.flushGlyphBatch();
+        return true;
     }
 
     private void ensureModuleListBackgroundGeometryCapacity(int rectangleCount) {
@@ -2612,19 +2712,15 @@ public class Interface extends Module {
 
     private void renderWatermark(NVGU vg) {
         String waterText;
-        String first;
-        String after;
 
         switch (waterMarkMode.get().toLowerCase(Locale.ROOT)) {
             case "simple":
                 waterText = waterMarkText.get() + " " + Client.clientVersion + " | " + mc.getFps() + " fps";
-                first = waterText.substring(0, 1);
-                after = waterText.substring(1);
                 float boxWidth = NVGFonts.INTER.getWidth(waterText, 20f) + 21f;
                 float boxHeight = NVGFonts.INTER.getHeight(20f) + 13f;
-                NanoVGTheme.renderPanel(vg, 16f, 16f, boxWidth, boxHeight, 14f, 1f);
-                NVGFonts.INTER.drawText(first, 26f, 22f, 20f, NanoVGTheme.ACCENT, Alignment.LEFT_TOP, true);
-                NVGFonts.INTER.drawText(after, NVGFonts.INTER.getWidth(first, 20f) + 26f, 22f, 20f, new Color(255, 255, 255, 255), Alignment.LEFT_TOP, true);
+                NanoVGTheme.renderPanel(vg, 16f, 16f, boxWidth, boxHeight, NanoVGTheme.RADIUS_PANEL, 1f);
+                watermarkGlyphColour.update(waterText, 26f, 20f, WATERMARK_SOFT_WHITE);
+                NVGFonts.INTER.drawGradientText(waterText, 26f, 22f, 20f, Alignment.LEFT_TOP, true, watermarkGlyphColour);
                 break;
 
             case "bullshit":
@@ -2637,12 +2733,10 @@ public class Interface extends Module {
                 float fpsWidth = NVGFonts.INTER.getWidth(fpsText, 18f);
                 float width = Math.max(titleWidth, fpsWidth) + padding * 2;
                 float height = NVGFonts.INTER.getHeight(20f) + NVGFonts.INTER.getHeight(18f) + padding * 3;
-                NanoVGTheme.renderPanel(vg, x, y, width, height - 6f, 16f, 1f);
-                first = waterText.substring(0, 1);
-                after = waterText.substring(1);
-                NVGFonts.INTER.drawText(first, x + padding, y + padding, 20f, NanoVGTheme.ACCENT, Alignment.LEFT_TOP, true);
-                NVGFonts.INTER.drawText(after, x + padding + NVGFonts.INTER.getWidth(first, 20f), y + padding, 20f, new Color(255, 255, 255, 255), Alignment.LEFT_TOP, true);
-                NVGFonts.INTER.drawText(fpsText, x + padding, y + padding + NVGFonts.INTER.getHeight(20f) + 6f, 18f, new Color(200, 200, 200, 180), Alignment.LEFT_TOP, true);
+                NanoVGTheme.renderPanel(vg, x, y, width, height - 6f, NanoVGTheme.RADIUS_MENU, 1f);
+                watermarkGlyphColour.update(waterText, x + padding, 20f, 255);
+                NVGFonts.INTER.drawGradientText(waterText, x + padding, y + padding, 20f, Alignment.LEFT_TOP, true, watermarkGlyphColour);
+                NVGFonts.INTER.drawText(fpsText, x + padding, y + padding + NVGFonts.INTER.getHeight(20f) + 6f, 18f, new Color(WATERMARK_SOFT_WHITE, WATERMARK_SOFT_WHITE, WATERMARK_SOFT_WHITE), Alignment.LEFT_TOP, true);
                 break;
         }
     }
@@ -2655,7 +2749,7 @@ public class Interface extends Module {
                 waterText = waterMarkText.get() + " " + Client.clientVersion + " | " + mc.getFps() + " fps";
                 float boxWidth = NVGFonts.INTER.getWidth(waterText, 20f) + 21f;
                 float boxHeight = NVGFonts.INTER.getHeight(20f) + 13f;
-                NanoVGTheme.renderPanelEffects(vg, 16f, 16f, boxWidth, boxHeight, 14f, 1f);
+                NanoVGTheme.renderPanelEffects(vg, 16f, 16f, boxWidth, boxHeight, NanoVGTheme.RADIUS_PANEL, 1f);
                 break;
 
             case "bullshit":
@@ -2668,7 +2762,7 @@ public class Interface extends Module {
                 float fpsWidth = NVGFonts.INTER.getWidth(fpsText, 18f);
                 float width = Math.max(titleWidth, fpsWidth) + padding * 2;
                 float height = NVGFonts.INTER.getHeight(20f) + NVGFonts.INTER.getHeight(18f) + padding * 3;
-                NanoVGTheme.renderPanelEffects(vg, x, y, width, height - 6f, 16f, 1f);
+                NanoVGTheme.renderPanelEffects(vg, x, y, width, height - 6f, NanoVGTheme.RADIUS_MENU, 1f);
                 break;
         }
     }
@@ -2790,7 +2884,6 @@ public class Interface extends Module {
         clearPlayerListEntries();
         tabGuiExpanded = false;
         tabGuiExpandProgress = 0f;
-        tabGuiCategorySelectionY = Float.NaN;
         tabGuiModuleSelectionY = Float.NaN;
         lastRenderNanos = 0L;
         clearTargetHudTracking();
@@ -2877,7 +2970,6 @@ public class Interface extends Module {
                     updateTabGuiAnimations(finalDeltaSpeed, tabGuiCategories, tabGuiModules);
                 } else {
                     tabGuiExpandProgress = 0f;
-                    tabGuiCategorySelectionY = Float.NaN;
                     tabGuiModuleSelectionY = Float.NaN;
                 }
                 if (notifications.get())

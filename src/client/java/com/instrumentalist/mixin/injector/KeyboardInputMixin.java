@@ -7,7 +7,6 @@ import com.instrumentalist.krs.hacks.features.player.LookTP;
 import com.instrumentalist.krs.hacks.features.player.Scaffold;
 import com.instrumentalist.krs.hacks.features.combat.WTap;
 import com.instrumentalist.krs.utils.GuiInputBlocker;
-import net.minecraft.client.KeyMapping;
 import com.instrumentalist.krs.utils.move.InputUtil;
 import net.minecraft.client.player.ClientInput;
 import net.minecraft.client.player.KeyboardInput;
@@ -18,12 +17,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(KeyboardInput.class)
 public abstract class KeyboardInputMixin {
-
-    @Inject(method = "tick", at = @At("HEAD"))
-    private void syncNanoVGClickGuiMovementKeys(CallbackInfo ci) {
-        if (GuiInputBlocker.shouldSyncNanoVGClickGuiMovementKeys())
-            KeyMapping.setAll();
-    }
 
     @Inject(method = "tick", at = @At("TAIL"))
     private void fixMovementAndStopWhenImguiCapturesKeyboard(CallbackInfo ci) {

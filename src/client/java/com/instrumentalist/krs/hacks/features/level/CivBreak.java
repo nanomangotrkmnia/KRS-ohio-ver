@@ -14,6 +14,7 @@ import com.instrumentalist.krs.utils.math.BehaviorUtils;
 import com.instrumentalist.krs.utils.math.MSTimer;
 import com.instrumentalist.krs.utils.math.ToolUtil;
 import com.instrumentalist.krs.utils.packet.PacketUtil;
+import com.instrumentalist.krs.utils.render.BlockHighlight;
 import com.instrumentalist.krs.utils.value.BooleanValue;
 import com.instrumentalist.krs.utils.value.FloatValue;
 import com.instrumentalist.krs.utils.value.IntValue;
@@ -39,11 +40,15 @@ public class CivBreak extends Module {
     private static final IntValue fastSpeed = new IntValue("Fast Speed", 10, 1, 10, () -> mode.get().equalsIgnoreCase("instant") || mode.get().equalsIgnoreCase("wait one break"));
 
     @Setting
+    private static final ListValue swingOrderMode = new ListValue("Swing Order Mode", new String[]{"Normal", "Packet", "No Order"}, "Packet");
+
+    @Setting
     private static final BooleanValue rotations = new BooleanValue("Rotations", true);
 
     private static boolean wasBreaking = false;
 
     private final MSTimer rotateTimer = new MSTimer();
+    private final BlockHighlight blockHighlight = new BlockHighlight();
     private int originalSlot = -1;
     private BlockPos pos = null;
     private Direction direction = null;
@@ -72,6 +77,7 @@ public class CivBreak extends Module {
         pos = null;
         direction = null;
         stage = 0;
+        blockHighlight.release();
     }
 
     @Override
@@ -105,6 +111,7 @@ public class CivBreak extends Module {
         var player = mc.player;
         var level = mc.level;
         var gameMode = mc.gameMode;
+        blockHighlight.setTarget(null);
         if (player == null || level == null || gameMode == null || gameMode.getPlayerMode() == GameType.ADVENTURE || gameMode.getPlayerMode() == GameType.SPECTATOR) return;
         if (ModuleManager.getModuleState(Scaffold.class)) return;
 
@@ -151,12 +158,13 @@ public class CivBreak extends Module {
             stage = 1;
 
         wasBreaking = true;
+        blockHighlight.setTarget(targetPos);
 
         switch (stage) {
-            case 0 -> PlayerUtil.INSTANCE.destroyBlock(targetPos);
+            case 0 -> PlayerUtil.INSTANCE.destroyBlock(targetPos, swingOrderMode.get());
             case 1 -> {
                 if (rotateTimer.hasTimePassed(1000L / (fastSpeed.get() + 2))) {
-                    PlayerUtil.INSTANCE.sendSwingPacket(InteractionHand.MAIN_HAND);
+                    PlayerUtil.INSTANCE.swingHand(InteractionHand.MAIN_HAND, swingOrderMode.get());
                     ServerboundPlayerActionPacket.Action action = mc.player.isCreative() ? ServerboundPlayerActionPacket.Action.START_DESTROY_BLOCK : ServerboundPlayerActionPacket.Action.STOP_DESTROY_BLOCK;
                     for (int i = 0; i < 2; i++) {
                         PacketUtil.sendPacket(new ServerboundPlayerActionPacket(

@@ -9,14 +9,15 @@ import java.util.List;
 public final class NanoVGTheme {
     public static final Color BASE = new Color(0x16, 0x16, 0x16);
     public static final Color TEXT = new Color(0xF6, 0xF6, 0xF1);
-    public static final Color MUTED = new Color(0xC8, 0xC8, 0xC2);
-    public static final Color DANGER = new Color(0xFF, 0x3D, 0x2E);
-    public static final Color WARNING = new Color(0xFF, 0x8A, 0x00);
-    public static final Color ACCENT = new Color(0x00, 0xFF, 0xFF);
-    public static final float RADIUS_HUD = 8f;
-    public static final float RADIUS_PANEL = 12f;
-    public static final float RADIUS_MENU = 18f;
-    public static final float RADIUS_CONTROL = 8f;
+    public static final Color MUTED = new Color(0x9C, 0x9C, 0x97);
+    public static final Color DANGER = new Color(0xFF, 0x45, 0x3A);
+    public static final Color WARNING = new Color(0xFF, 0x9F, 0x0A);
+    public static final Color ACCENT = new Color(0x7F, 0xB4, 0xBF);
+    public static final float RADIUS_LABEL = 4f;
+    public static final float RADIUS_HUD = 6f;
+    public static final float RADIUS_PANEL = 10f;
+    public static final float RADIUS_MENU = 12f;
+    public static final float RADIUS_CONTROL = RADIUS_HUD;
     private static final Shader2DRenderer.GlassRequest PANEL_GLASS = Shader2DRenderer.GlassRequest.panel();
     private static final Shader2DRenderer.GlassRequest COMPACT_GLASS = Shader2DRenderer.GlassRequest.compact();
     private static final Shader2DRenderer.GlassRequest CONTROL_GLASS = Shader2DRenderer.GlassRequest.control();
@@ -25,8 +26,8 @@ public final class NanoVGTheme {
     private static final Color PANEL_BOTTOM = new Color(0x16, 0x16, 0x16, 92);
 
     public static final Color COMPACT_BACKGROUND = new Color(0x16, 0x16, 0x16, 78);
-    public static final Color SWITCH_ON = new Color(0x2F, 0xD1, 0x6A);
-    public static final Color SLIDER_FILL = new Color(0xFF, 0xB3, 0x40);
+    public static final Color SWITCH_ON = ACCENT;
+    public static final Color SLIDER_FILL = ACCENT;
     public static final Color INPUT_FOCUS = new Color(0xEE, 0xF2, 0xF7);
     public static final Color SCROLLBAR_THUMB = new Color(0xEE, 0xF2, 0xF7);
     public static final Color CONTROL_TRACK = new Color(255, 255, 255, 190);
@@ -35,6 +36,7 @@ public final class NanoVGTheme {
     private static final float[] CONNECTED_BOXES = new float[256];
     private static final float[] CONNECTED_RADII = new float[256];
     private static final float[] CORNER_SCRATCH = new float[4];
+    private static float[] connectedGeometry = new float[32 * 8];
 
     private NanoVGTheme() {
     }
@@ -101,25 +103,31 @@ public final class NanoVGTheme {
         if (opacity <= 0.001f)
             return;
 
-        for (int i = 0, n = entries.size(); i < n; i++) {
+        int count = entries.size();
+        if (connectedGeometry.length < count * 8)
+            connectedGeometry = new float[Math.max(count * 8, connectedGeometry.length * 2)];
+
+        int written = 0;
+        for (int i = 0; i < count; i++) {
             ConnectedGlassRect entry = entries.get(i);
             if (entry == null || entry.width() <= 0f || entry.height() <= 0f)
                 continue;
 
             writeCorners(entries, i, radius, CORNER_SCRATCH);
-            renderCompact(
-                    vg,
-                    entry.x(),
-                    entry.y(),
-                    entry.width(),
-                    entry.height(),
-                    CORNER_SCRATCH[0],
-                    CORNER_SCRATCH[1],
-                    CORNER_SCRATCH[2],
-                    CORNER_SCRATCH[3],
-                    opacity
-            );
+            int offset = written * 8;
+            connectedGeometry[offset] = entry.x();
+            connectedGeometry[offset + 1] = entry.y();
+            connectedGeometry[offset + 2] = entry.width();
+            connectedGeometry[offset + 3] = entry.height();
+            connectedGeometry[offset + 4] = CORNER_SCRATCH[0];
+            connectedGeometry[offset + 5] = CORNER_SCRATCH[1];
+            connectedGeometry[offset + 6] = CORNER_SCRATCH[2];
+            connectedGeometry[offset + 7] = CORNER_SCRATCH[3];
+            written++;
         }
+
+        if (written > 0)
+            vg.roundedRectangles(connectedGeometry, written, scaledAlpha(COMPACT_BACKGROUND, opacity, 0));
     }
 
     private static int packConnected(List<? extends ConnectedGlassRect> entries, float radius) {
@@ -162,14 +170,23 @@ public final class NanoVGTheme {
         ConnectedGlassRect next = index + 1 < entries.size() ? entries.get(index + 1) : null;
         float left = entry.x();
         float right = entry.x() + entry.width();
-        output[0] = coversCorner(previous, left) ? 0f : radius;
-        output[1] = coversCorner(previous, right) ? 0f : radius;
-        output[2] = coversCorner(next, right) ? 0f : radius;
-        output[3] = coversCorner(next, left) ? 0f : radius;
+        output[0] = exposedCornerRadius(previous, left, radius);
+        output[1] = exposedCornerRadius(previous, right, radius);
+        output[2] = exposedCornerRadius(next, right, radius);
+        output[3] = exposedCornerRadius(next, left, radius);
     }
 
-    private static boolean coversCorner(ConnectedGlassRect neighbor, float cornerX) {
-        return neighbor != null && cornerX >= neighbor.x() - 0.5f && cornerX <= neighbor.x() + neighbor.width() + 0.5f;
+    private static float exposedCornerRadius(ConnectedGlassRect neighbor, float cornerX, float radius) {
+        if (neighbor == null)
+            return radius;
+
+        float neighborLeft = neighbor.x();
+        float neighborRight = neighbor.x() + neighbor.width();
+        if (cornerX >= neighborLeft - 0.5f && cornerX <= neighborRight + 0.5f)
+            return 0f;
+
+        float exposedWidth = cornerX < neighborLeft ? neighborLeft - cornerX : cornerX - neighborRight;
+        return Math.min(radius, exposedWidth);
     }
 
     public interface ConnectedGlassRect {
